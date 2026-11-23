@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>商品库 | 柜子商品目录</title>
+<style>
+:root{font-family:"Noto Sans CJK SC","Microsoft YaHei",sans-serif;color:#172a34;background:#f2f6f5;font-synthesis:none}*{box-sizing:border-box}body{margin:0}.top{background:#123d42;color:white;padding:32px max(24px,calc((100vw - 1320px)/2)) 34px}.top-inner{display:flex;justify-content:space-between;align-items:end;gap:20px}.brand{font-size:13px;color:#a6d2c9;letter-spacing:.08em}.top h1{font-size:30px;letter-spacing:.02em;margin:10px 0 8px}.top p{margin:0;color:#c5ded9;font-size:14px;line-height:1.7}.stamp{font-size:13px;color:#c5ded9;white-space:nowrap}.main{max-width:1368px;padding:28px 24px 60px;margin:auto}.controls{display:flex;align-items:end;gap:14px;flex-wrap:wrap}.field{display:grid;gap:7px;font-size:13px;font-weight:600;color:#496068}.field select,.field input{height:43px;border:1px solid #c9d9d5;border-radius:8px;background:white;padding:0 13px;font:inherit;font-weight:400;color:#172a34;min-width:240px}.field input{min-width:270px}.field select:focus,.field input:focus,button:focus-visible{outline:3px solid #71bdb0;outline-offset:2px}.summary{margin:26px 0 16px;display:flex;align-items:baseline;justify-content:space-between;gap:10px}.summary h2{font-size:18px;margin:0}.summary span{font-size:13px;color:#697f81}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(185px,1fr));gap:14px}.card{overflow:hidden;background:#fff;border:1px solid #dae7e3;border-radius:10px;text-align:left;padding:0;cursor:pointer;color:inherit;font:inherit}.card:hover{border-color:#7ab7ab}.photo{height:178px;background:#e7efec;display:grid;place-items:center;padding:12px}.photo img{width:100%;height:100%;object-fit:contain}.placeholder{color:#829995;font-size:13px}.info{padding:14px}.name{font-weight:700;overflow-wrap:anywhere;font-size:15px}.meta{color:#748987;font-size:12px;margin-top:7px}.empty{padding:70px 15px;text-align:center;color:#718784}.notice{font-size:13px;color:#607a76;margin-top:30px;line-height:1.7}dialog{border:0;border-radius:12px;padding:0;max-width:min(850px,94vw);width:850px;max-height:90vh;color:#172a34;box-shadow:0 20px 60px #102a2b50}dialog::backdrop{background:#102d31aa}.dialog-head{display:flex;justify-content:space-between;align-items:center;padding:20px 24px;border-bottom:1px solid #e2ece8}.dialog-head h2{margin:0;font-size:18px}.close{border:0;background:#edf4f1;border-radius:6px;padding:8px 12px;cursor:pointer}.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;padding:20px}.gallery img{width:100%;height:190px;object-fit:contain;background:#edf4f1;border-radius:8px;padding:8px}@media(max-width:600px){.top-inner{display:block}.stamp{margin-top:16px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.photo{height:145px}.field,.field input,.field select{width:100%;min-width:0}}
+.cabinet-field{position:relative}.cabinet-picker{position:relative;min-width:240px}.cabinet-picker summary{height:43px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:20px;background:white;border:1px solid #c9d9d5;border-radius:8px;padding:0 13px;font-weight:400;color:#172a34;cursor:pointer}.cabinet-picker summary::-webkit-details-marker{display:none}.cabinet-picker summary::after{content:"";width:7px;height:7px;border-right:1.5px solid #496068;border-bottom:1.5px solid #496068;transform:rotate(45deg);margin-top:-4px}.cabinet-picker summary:focus-visible,.cabinet-option:focus-visible{outline:3px solid #71bdb0;outline-offset:2px}.cabinet-options{position:absolute;z-index:5;top:calc(100% + 5px);left:0;right:0;max-height:240px;overflow:auto;background:white;border:1px solid #c9d9d5;border-radius:8px;box-shadow:0 8px 18px #123d4220;padding:4px}.cabinet-option{display:block;width:100%;text-align:left;border:0;background:white;border-radius:5px;padding:10px;font:inherit;color:#172a34;cursor:pointer;overflow-wrap:anywhere}.cabinet-option:hover,.cabinet-option[aria-checked="true"]{background:#e7f2ee}@media(max-width:600px){.cabinet-picker{width:100%;min-width:0}}
+.photo{min-width:0;min-height:0;overflow:hidden}.photo img{display:block;min-width:0;min-height:0;max-width:100%;max-height:100%}
+</style></head><body><header class="top"><div class="top-inner"><div><div class="brand">商品目录</div><h1>柜子商品库</h1><p>选择柜子，查看该柜已登记的商品和参考图片。</p></div><div class="stamp">正在连接商品库</div></div></header><main class="main"><div class="controls"><div class="field cabinet-field"><span id="cabinet-label">选择柜子</span><details class="cabinet-picker" id="cabinet-picker"><summary id="cabinet-current" aria-labelledby="cabinet-label cabinet-current">选择柜子</summary><div class="cabinet-options" id="cabinet-options" role="radiogroup" aria-labelledby="cabinet-label"></div></details></div><label class="field">查找商品<input id="search" type="search" placeholder="输入商品名称或编号"></label></div><div class="summary"><h2>商品列表</h2><span id="count" aria-live="polite"></span></div><div id="grid" class="grid"></div><div id="empty" class="empty" hidden>没有找到匹配的商品。</div><p class="notice">商品和参考图每 5 秒自动更新。</p></main><dialog id="detail"><div class="dialog-head"><h2 id="detail-title"></h2><button class="close" id="close" type="button">关闭</button></div><div id="gallery" class="gallery"></div></dialog><script>
+if (location.protocol === 'file:') location.replace('http://127.0.0.1:8768/catalog');
+const picker=document.querySelector('#cabinet-picker'), current=document.querySelector('#cabinet-current'), options=document.querySelector('#cabinet-options'), cabinet={value:''}, search=document.querySelector('#search'), grid=document.querySelector('#grid'), count=document.querySelector('#count'), empty=document.querySelector('#empty'), dialog=document.querySelector('#detail'), gallery=document.querySelector('#gallery'), stamp=document.querySelector('.stamp');
+let products=[], requestNumber=0, currentDetail=null, lastProductSignature='', lastCabinetsSignature='';
+function drawOptions(ids){
+  const signature=JSON.stringify([ids,cabinet.value]);
+  if(signature===lastCabinetsSignature)return;
+  lastCabinetsSignature=signature;
+  options.replaceChildren();
+  current.textContent=cabinet.value || '暂无柜子';
+  for(const id of ids){
+    const button=document.createElement('button');button.type='button';button.className='cabinet-option';
+    button.setAttribute('role','radio');button.setAttribute('aria-checked',String(id===cabinet.value));button.textContent=id;
+    button.addEventListener('click',()=>{cabinet.value=id;current.textContent=id;for(const item of options.children)item.setAttribute('aria-checked',String(item===button));picker.open=false;current.focus();if(dialog.open)dialog.close();currentDetail=null;lastProductSignature='';products=[];render();refreshProducts();});
+    options.append(button);
+  }
+}
+document.addEventListener('click',e=>{if(!picker.contains(e.target))picker.open=false});
+picker.addEventListener('keydown',e=>{if(e.key==='Escape'&&picker.open){picker.open=false;current.focus()}});
+function showDetail(p,open=true){
+  currentDetail=p.id;document.querySelector('#detail-title').textContent=`${p.name} · 编号 ${p.id}`;gallery.replaceChildren();
+  if(!p.image_urls.length)gallery.textContent='暂无可用参考图';
+  for(const path of p.image_urls){const img=document.createElement('img');img.src=path;img.alt=`${p.name} 参考图`;gallery.append(img)}
+  if(open&&!dialog.open)dialog.showModal();
+}
+function render(){
+  const term=search.value.trim().toLowerCase();const list=products.filter(p=>(`${p.name} ${p.id} product_${p.id}`).toLowerCase().includes(term));
+  grid.replaceChildren();count.textContent=`${list.length} 件商品`;empty.hidden=!!list.length;
+  for(const p of list){
+    const card=document.createElement('button');card.type='button';card.className='card';const photo=document.createElement('div');photo.className='photo';
+    if(p.image_urls.length){const img=document.createElement('img');img.loading='lazy';img.src=p.image_urls[0];img.alt=p.name;img.onerror=()=>{photo.textContent='图片无法加载';photo.classList.add('placeholder')};photo.append(img)}else{photo.textContent='暂无图片';photo.classList.add('placeholder')}
+    const info=document.createElement('div');info.className='info';const name=document.createElement('div');name.className='name';name.textContent=p.name;
+    const meta=document.createElement('div');meta.className='meta';meta.textContent=`编号 ${p.id} · ${p.image_count} 张参考图`;info.append(name,meta);card.append(photo,info);card.addEventListener('click',()=>showDetail(p));grid.append(card)
+  }
+}
+async function readJSON(url){const response=await fetch(url,{cache:'no-store'});if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}
+async function refreshProducts(){
+  const selected=cabinet.value, request=++requestNumber;
+  if(!selected){products=[];render();return}
+  try{
+    const next=await readJSON(`/products?cabinet_id=${encodeURIComponent(selected)}`);
+    if(request!==requestNumber||selected!==cabinet.value)return;
+    const signature=JSON.stringify(next);
+    if(signature!==lastProductSignature){
+      products=next;lastProductSignature=signature;render();
+      if(dialog.open&&currentDetail!==null){const item=products.find(p=>p.id===currentDetail);if(item)showDetail(item,false);else{dialog.close();currentDetail=null}}
+    }
+    stamp.textContent=`已更新 · ${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
+  }catch(error){if(request===requestNumber)stamp.textContent='更新失败，5 秒后重试'}
+}
+async function refreshAll(){
+  try{
+    const ids=(await readJSON('/cabinets')).map(x=>x.cabinet_id);
+    if(!ids.includes(cabinet.value)){cabinet.value=ids[0]||'';lastProductSignature='';if(dialog.open)dialog.close();currentDetail=null}
+    drawOptions(ids);
+    await refreshProducts();
+    if(!ids.length)stamp.textContent='暂无已登记的柜子';
+  }catch(error){stamp.textContent='连接失败，5 秒后重试'}
+}
+search.addEventListener('input',render);document.querySelector('#close').addEventListener('click',()=>dialog.close());dialog.addEventListener('close',()=>{currentDetail=null});
+refreshAll();setInterval(refreshAll,5000);
+</script></body></html>

@@ -1,0 +1,13 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+.env
+data/
+models/
+runtime/
+logs/
+.sku_api_jobs/
+.sku_restore/
+tests/product/
+tests/video/

@@ -1,0 +1,26 @@
+[project]
+name = "visual-vending"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.32,<1",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "httpx>=0.27,<1", "numpy>=1.24", "opencv-python-headless>=4.8", "Pillow>=10"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "vending*"]

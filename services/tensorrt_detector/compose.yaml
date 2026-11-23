@@ -1,0 +1,17 @@
+services:
+  detector:
+    build: .
+    image: sku-tensorrt-detector:local
+    container_name: sku-tensorrt-detector
+    restart: unless-stopped
+    mem_limit: 8g
+    cpus: 4
+    gpus: all
+    network_mode: bridge
+    ports:
+      - "127.0.0.1:8770:8770"
+      - "172.17.0.1:8770:8770"
+    volumes:
+      - ../..:/workspace:ro
+      - ../../models/tensorrt_detector:/models:ro
+      - ../../runtime/tensorrt_detector/deps:/runtime:ro
