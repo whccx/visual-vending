@@ -433,6 +433,15 @@ class Store:
                     db.execute("UPDATE sku_version SET state=1 WHERE id=?", (job["ref"],))
             return job
 
+    def retry_job(self, job) -> None:
+        """事务失败后只重排仍在执行的任务。"""
+        with self.connection(write=True) as db:
+            changed = db.execute(
+                "UPDATE job SET state='pending' WHERE id=? AND state='running'", (job["id"],)
+            ).rowcount
+            if changed and job["kind"] == "sku":
+                db.execute("UPDATE sku_version SET state=0 WHERE id=?", (job["ref"],))
+
     def review_data(self, version: int):
         with self.connection() as db:
             row = db.execute(

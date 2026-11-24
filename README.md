@@ -23,6 +23,8 @@
 
 两种回调各自向提交时的 `notify_url` 发送签名 POST。确认采用 HTTP 200 和文档的 JSON 确认体，失败时依次延迟 10、30、60、120、180 秒重试。结果和待发回调同事务保存，识别任务绑定接单时的有效商品版本。worker 重启会接续处理中任务和未确认回调。接收方应按业务 ID 处理重复回调。
 
+视频识别默认最多同时处理 5 个视频，额外任务排队等待，完成一个视频后自动接续下一个。同一订单的主辅视频共用视频并发名额，全部处理完成并核对一致性后返回订单结果。帧级处理使用 3 个柜区检测线程、2 个 HOI 检测实例和 2 个 BG0 实例。手部和运动联合筛帧保留触发帧前后各 10 帧。
+
 文档的集合 SKU 提交尚未开放。运营方可以导入标准库和集合 SKU 的查询数据。
 
 ## 本机启动
@@ -58,6 +60,7 @@ curl --cacert data/tls.crt https://localhost:18768/health
 | `VENDING_MODEL_DIR`、`VENDING_RUNTIME_DIR` | 指向只读模型与运行库。默认读取本项目的 `models`、`runtime`。 |
 | `VENDING_ASSET_HOSTS`、`VENDING_CALLBACK_HOSTS` | 允许的媒体和回调主机。 |
 | `VENDING_CALLBACK_DELAY` | 终态首次投递前的等待时间，默认 3 秒。实际切换要按 Java 事务落库窗口核实。 |
+| `VENDING_VIDEO_CONCURRENCY` | 同时处理的视频数，默认 5，可设置 1 至 5。修改后需重新创建 worker 容器。 |
 | `VENDING_PUBLIC_URL` | 用于生成可访问的 300×300 商品封面地址。未配置时使用第一张参考图地址。 |
 | `VENDING_CHECK_IMAGE_SIZE` | 默认检查参考图尺寸及比例。设为 0 可用非标准参考图做本机验收。 |
 | `VENDING_REVIEW_DETECTOR` | 默认 `onnx`，使用本容器的 YOLO-World。可显式选择 `yoloe`，或用 `auto` 优先选择可用的 YOLO-World。 |

@@ -56,7 +56,9 @@ services:
       <<: *runtime-env
       TZ: Asia/Shanghai
       SKU_HOI_TENSORRT_URL: http://detector:8770
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics,display
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video,graphics,display
+      OPENCV_VIDEOIO_PRIORITY_CV_IMAGES: "1100"
+      VENDING_VIDEO_CONCURRENCY: ${VENDING_VIDEO_CONCURRENCY:-5}
       EGL_PLATFORM: surfaceless
       __EGL_VENDOR_LIBRARY_FILENAMES: /workspace/runtime/gpu/10_nvidia.json
       PYTHONPATH: /workspace:/opt/sku-runtime/dino:/opt/sku-runtime/yolo:/opt/sku-runtime/mediapipe

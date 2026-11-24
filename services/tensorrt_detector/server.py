@@ -1,23 +1,23 @@
 """独立的 TensorRT 视频检测 HTTP 服务。"""
 
-import logging
 import base64
-import threading
+import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from queue import Queue
 
+import cv2
+from bg0 import Bg0Segmenter
+from detector import Detector, hoi_input
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-import cv2
-
-from detector import Detector
-from bg0 import Bg0Segmenter
 
 LOG = logging.getLogger("tensorrt_detector")
 WORKSPACE = Path("/workspace").resolve()
 MODEL_DIR = Path("/models")
-LOCK = threading.Lock()
+detector_pool = Queue()
+bg0_pool = Queue()
 detector = None
 bg0 = None
 
@@ -26,17 +26,32 @@ bg0 = None
 async def lifespan(app):
     """进程启动时加载并预热引擎。"""
     global detector, bg0
-    detector = Detector(MODEL_DIR)
-    detector.warmup()
-    bg0 = Bg0Segmenter(MODEL_DIR, detector.logger)
-    bg0.warmup()
+    detectors = []
+    segmenters = []
+    for _ in range(2):
+        model = Detector(MODEL_DIR)
+        model.warmup()
+        detectors.append(model)
+        detector_pool.put(model)
+    for _ in range(2):
+        model = Bg0Segmenter(MODEL_DIR, detectors[0].logger)
+        model.warmup()
+        segmenters.append(model)
+        bg0_pool.put(model)
+    detector, bg0 = detectors[0], segmenters[0]
     app.state.ready = True
     try:
         yield
     finally:
         app.state.ready = False
-        bg0.close()
-        detector.close()
+        while not bg0_pool.empty():
+            bg0_pool.get_nowait()
+        while not detector_pool.empty():
+            detector_pool.get_nowait()
+        for model in segmenters:
+            model.close()
+        for model in detectors:
+            model.close()
         bg0 = None
         detector = None
 
@@ -61,6 +76,15 @@ class SegmentRequest(BaseModel):
     threshold: float = Field(ge=0.0, le=1.0)
 
 
+class FrameRequest(BaseModel):
+    image_path: str
+
+
+class FrameSegmentRequest(FrameRequest):
+    box: list[int] = Field(min_length=4, max_length=4)
+    threshold: float = Field(ge=0.0, le=1.0)
+
+
 def video_path(value):
     path = Path(value)
     if not path.is_absolute():
@@ -81,8 +105,11 @@ def detect(request: DetectRequest):
     """读取共享目录内的视频，返回每帧货柜、手和商品检测结果。"""
     path = video_path(request.video_path)
     try:
-        with LOCK:
-            return detector.detect(path, request.area_missing_max_frames, request.areas)
+        model = detector_pool.get()
+        try:
+            return model.detect(path, request.area_missing_max_frames, request.areas)
+        finally:
+            detector_pool.put(model)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -97,7 +124,8 @@ def segment(request: SegmentRequest):
     if len({point.frame for point in request.points}) != len(request.points):
         raise HTTPException(status_code=400, detail="帧号不能重复")
     try:
-        with LOCK:
+        model = bg0_pool.get()
+        try:
             started = time.monotonic()
             read_seconds = infer_seconds = encode_seconds = 0.0
             masks = []
@@ -110,30 +138,84 @@ def segment(request: SegmentRequest):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, point.frame - 1)
                     ok, image = cap.read()
                     if not ok:
-                        raise ValueError("无法读取第 {} 帧".format(point.frame))
+                        raise ValueError(f"无法读取第 {point.frame} 帧")
                     height, width = image.shape[:2]
                     x1, y1, x2, y2 = point.box
                     if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
-                        raise ValueError("第 {} 帧商品框无效".format(point.frame))
+                        raise ValueError(f"第 {point.frame} 帧商品框无效")
                     read_seconds += time.monotonic() - step
                     step = time.monotonic()
-                    mask = bg0.segment(image, point.box, request.threshold)
+                    mask = model.segment(image, point.box, request.threshold)
                     infer_seconds += time.monotonic() - step
                     step = time.monotonic()
                     ok, encoded = cv2.imencode(".png", mask.astype("uint8") * 255)
                     if not ok:
                         raise RuntimeError("掩码编码失败")
-                    masks.append({"frame": point.frame, "box": point.box,
-                                  "mask_png": base64.b64encode(encoded.tobytes()).decode("ascii")})
+                    masks.append(
+                        {
+                            "frame": point.frame,
+                            "box": point.box,
+                            "mask_png": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                        }
+                    )
                     encode_seconds += time.monotonic() - step
             finally:
                 cap.release()
-            timings = {"total_seconds": time.monotonic() - started, "read_seconds": read_seconds,
-                       "segment_seconds": infer_seconds, "encode_seconds": encode_seconds}
+            timings = {
+                "total_seconds": time.monotonic() - started,
+                "read_seconds": read_seconds,
+                "segment_seconds": infer_seconds,
+                "encode_seconds": encode_seconds,
+            }
             LOG.info("BG0 批量抠图：帧数=%s 耗时=%s", len(masks), timings)
             return {"masks": masks, "timings": timings}
+        finally:
+            bg0_pool.put(model)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         LOG.exception("BG0 批量抠图失败")
         raise HTTPException(status_code=500, detail="BG0 批量抠图失败，请查看服务日志") from exc
+
+
+@app.post("/frame/detect")
+def detect_frame(request: FrameRequest):
+    """从共享目录读取一帧，以独立 TensorRT 上下文执行检测。"""
+    path = video_path(request.image_path)
+    image = cv2.imread(str(path))
+    if image is None or image.shape != (1080, 1920, 3):
+        raise HTTPException(status_code=400, detail="视频帧无法读取或尺寸不符合要求")
+    model = detector_pool.get()
+    try:
+        hands, products = model.decode(model.hoi.infer(hoi_input(image)))
+        return {"hands": hands, "products": products}
+    except Exception as exc:
+        LOG.exception("TensorRT 单帧检测失败")
+        raise HTTPException(status_code=500, detail="单帧检测失败") from exc
+    finally:
+        detector_pool.put(model)
+
+
+@app.post("/frame/segment")
+def segment_frame(request: FrameSegmentRequest):
+    """对一帧的商品框执行 BG0 并返回框内掩码。"""
+    path = video_path(request.image_path)
+    image = cv2.imread(str(path))
+    if image is None:
+        raise HTTPException(status_code=400, detail="视频帧无法读取")
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = request.box
+    if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+        raise HTTPException(status_code=400, detail="商品框无效")
+    model = bg0_pool.get()
+    try:
+        mask = model.segment(image, request.box, request.threshold)
+        ok, encoded = cv2.imencode(".png", mask.astype("uint8") * 255)
+        if not ok:
+            raise RuntimeError("掩码编码失败")
+        return {"mask_png": base64.b64encode(encoded.tobytes()).decode("ascii")}
+    except Exception as exc:
+        LOG.exception("BG0 单帧抠图失败")
+        raise HTTPException(status_code=500, detail="单帧抠图失败") from exc
+    finally:
+        bg0_pool.put(model)

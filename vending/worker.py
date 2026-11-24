@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -26,11 +27,19 @@ ACK = {"code": "10000", "msg": "请求成功", "data": {}}
 
 class Worker:
     def __init__(
-        self, config: Settings, store: Store, pipeline: Pipeline, *, image_detector=None
+        self,
+        config: Settings,
+        store: Store,
+        pipeline: Pipeline,
+        *,
+        image_detector=None,
+        recognition_pipeline=None,
     ) -> None:
         self.config = config
         self.store = store
         self.pipeline = pipeline
+        self.recognition_pipeline = recognition_pipeline or pipeline
+        self.review_lock = threading.Lock()
         self.image_detector = (
             make_product_detector(config) if image_detector is None else image_detector
         )
@@ -39,10 +48,15 @@ class Worker:
         job = self.store.claim_job()
         if job is None:
             return False
-        if job["kind"] == "sku":
-            self.review(job)
-        else:
-            self.recognize(job)
+        try:
+            if job["kind"] == "sku":
+                with self.review_lock:
+                    self.review(job)
+            else:
+                self.recognize(job)
+        except Exception:
+            self.store.retry_job(job)
+            raise
         return True
 
     def review(self, job) -> None:
@@ -109,7 +123,7 @@ class Worker:
                 videos = video_files(body, shared, self.config)
                 for path in videos:
                     path.chmod(0o640)
-                result = self.pipeline.recognize(
+                result = self.recognition_pipeline.recognize(
                     videos, body["container_id"], features, comparison_assets=comparisons
                 )
         except MediaError as error:
@@ -177,7 +191,10 @@ def main() -> None:
         except BlockingIOError as exc:
             raise SystemExit("该数据目录已有 GPU worker") from exc
         store.requeue_jobs()
-        worker = Worker(config, store, Pipeline())
+        from vending.frame_pipeline import FrameRuntime
+
+        runtime = FrameRuntime(config.video_concurrency)
+        worker = Worker(config, store, Pipeline(), recognition_pipeline=runtime)
 
         def poll(method):
             while not stop.is_set():
@@ -190,11 +207,20 @@ def main() -> None:
 
         callbacks = threading.Thread(target=poll, args=(worker.deliver,), name="callbacks")
         callbacks.start()
+        LOG.info("视频识别并发上限：%s", config.video_concurrency)
         try:
-            poll(worker.process_job)
+            with ThreadPoolExecutor(
+                max_workers=config.video_concurrency, thread_name_prefix="订单"
+            ) as jobs:
+                futures = [
+                    jobs.submit(poll, worker.process_job) for _ in range(config.video_concurrency)
+                ]
+                for future in futures:
+                    future.result()
         finally:
             stop.set()
             callbacks.join()
+            runtime.close()
 
 
 if __name__ == "__main__":

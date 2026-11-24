@@ -26,6 +26,7 @@ class Settings:
     callback_delay: float = 3.0
     signature_age: int = 300
     max_pending: int = 100
+    video_concurrency: int = 5
     check_image_size: bool = True
     review_detector: str = "onnx"
     review_onnx_python: str = "/opt/comfy-conda/bin/python"
@@ -38,6 +39,9 @@ class Settings:
         if any(not account.secret for account in accounts.values()):
             raise ValueError("上游账户必须配置有效密钥")
         data_dir = Path(os.environ.get("VENDING_DATA_DIR", ROOT / "data")).resolve()
+        video_concurrency = int(os.environ.get("VENDING_VIDEO_CONCURRENCY", "5"))
+        if not 1 <= video_concurrency <= 5:
+            raise ValueError("视频并发数必须在 1 至 5 之间")
         return cls(
             data_dir=data_dir,
             accounts=accounts,
@@ -50,6 +54,7 @@ class Settings:
             public_url=os.environ.get("VENDING_PUBLIC_URL", "").rstrip("/"),
             callback_delay=float(os.environ.get("VENDING_CALLBACK_DELAY", "3")),
             max_pending=int(os.environ.get("VENDING_MAX_PENDING", "100")),
+            video_concurrency=video_concurrency,
             check_image_size=os.environ.get("VENDING_CHECK_IMAGE_SIZE", "1") == "1",
             review_detector=os.environ.get("VENDING_REVIEW_DETECTOR", "onnx").strip().lower(),
             review_onnx_python=os.environ.get(
