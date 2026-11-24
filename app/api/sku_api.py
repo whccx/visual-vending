@@ -18,12 +18,10 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import Response, FileResponse
 from urllib.parse import quote
 from app.restoration import image_restore
-from app.api import recognize_100doh, recognize_hoi_detr
+from app.api import recognize_hoi_detr
 from app.detection import area_detection, product_taken, yoloe_cutout
-from app.detection.person_gate_client import scan_person_gate
 from app.config import VIDEO_DIR
 from app import config
-from app.recognition.product_matching import accept_ranking
 
 ROOT = config.ROOT
 JOBS = config.JOBS
@@ -133,7 +131,7 @@ app = FastAPI(
     ],
     title="云平台-开门柜商品识别",
     version="1.0.0",
-    description="上传视频后复用 video 目录中内容相同的视频，不存在时保存新视频。GPU 接口使用 YOLOE-26L、商品轨迹及配置的 DINOv3 向量与颜色权重返回商品候选；轨迹点少于 5 个或前两名综合分差小于 0.03 时返回未识别。综合分不是经过概率校准的置信度。",
+    description=f"上传视频后复用 video 目录中内容相同的视频，不存在时保存新视频。视频识别接口通过独立 TensorRT 服务运行 HOI-DETR 检测人手与商品，并用配置的 DINOv3 向量与颜色权重返回商品候选；轨迹点少于 {config.SCORE_WINDOW_FRAMES} 个或前两名综合分差小于 {config.SCORE_MIN_MARGIN:g} 时返回未识别。综合分不是经过概率校准的置信度。",
 )
 
 
@@ -159,8 +157,6 @@ async def log_request(request, call_next):
     return response
 
 
-recognize_100doh.RESOURCE_LOCK = LOCK
-app.include_router(recognize_100doh.router)
 recognize_hoi_detr.RESOURCE_LOCK = LOCK
 app.include_router(recognize_hoi_detr.router)
 
@@ -184,8 +180,6 @@ def custom_openapi():
     )
     fields = (
         ("/products", "post", "images"),
-        ("/recognize-yoloe", "post", "video"),
-        ("/recognize-100doh", "post", "video"),
         ("/recognize-hoi-detr", "post", "video"),
         ("/detect-cabinet-area", "post", "video"),
         ("/detect-product-taken", "post", "video"),
@@ -220,29 +214,13 @@ class ProductResponse(BaseModel):
     image_urls: List[str] = Field(default_factory=list, description="原始参考图地址")
 
 
-class GPURecognitionResponse(BaseModel):
-    """GPU 视频识别接口的响应数据。"""
-
-    cabinet_id: str
-
-    status: str
-    product: Optional[str] = None
-    confidence: Optional[float] = None
-    vector_score: Optional[float] = None
-    color_score: Optional[float] = None
-    track_points: int = 0
-    frames: int
-    video_path: str = Field(description="项目根目录下实际使用的视频路径")
-    duration: float
-
-
 class AreaFrame(BaseModel):
     """单帧柜内区域检测结果。"""
 
     frame: int = Field(description="从 1 开始的帧号")
     time_seconds: float = Field(description="该帧时间，秒")
     polygon: Optional[List[List[int]]] = Field(
-        default=None, description="按左上、右上、右下、左下顺序的四个像素坐标；未检测到为 null"
+        default=None, description="柜内分割掩码的轮廓像素坐标；未检测到为 null"
     )
     confidence: Optional[float] = None
 
@@ -581,76 +559,5 @@ def detect_product_taken_api(
         except Exception:
             LOG.exception("拿走检测失败")
             raise HTTPException(status_code=500, detail="拿走检测失败，请查看容器日志")
-        finally:
-            video.file.close()
-
-
-@app.post(
-    "/recognize-yoloe",
-    response_model=GPURecognitionResponse,
-    tags=["商品识别"],
-    summary="GPU 视频商品识别",
-)
-def recognize_gpu(cabinet_id: str = Form(..., description="柜子编码"), video: UploadFile = File(..., description="待识别的视频文件")):
-    """使用 GPU 管线识别视频中的商品，并返回最佳候选及其分数。
-
-    参数：
-        video: 待识别的视频文件。
-    返回：
-        GPURecognitionResponse；无符合阈值的候选时状态为 not_found。
-    """
-    start = time.monotonic()
-    JOBS.mkdir(parents=True, exist_ok=True)
-    original = (video.filename or "").replace("\\", "/").split("/")[-1]
-    if (
-        not original
-        or original in (".", "..")
-        or any(ord(c) < 32 for c in original)
-        or not Path(original).suffix
-        or not Path(original).stem
-    ):
-        video.file.close()
-        raise HTTPException(status_code=400, detail="请提供有效的视频文件名（包含扩展名）")
-    require_known_cabinet(cabinet_id, video)
-    with LOCK, tempfile.TemporaryDirectory(prefix="job_", dir=JOBS) as tmp:
-        try:
-            video_path = store_video(video, original, Path(tmp), cabinet_id)
-            if not hasattr(app.state, "gpu_pipeline"):
-                from app.recognition.gpu_video_pipeline import GPUVideoPipeline
-                from app.detection.held_product_detect import load_gpu_hands
-
-                app.state.gpu_pipeline = GPUVideoPipeline(
-                    app.state.detector,
-                    app.state.dino,
-                    load_gpu_hands(),
-                    batch_size=config.gpu_batch_size(),
-                )
-            person_flags = scan_person_gate(app.state, video_path)
-            if not hasattr(app.state, "area_model"):
-                app.state.area_model = area_detection.load_model()
-            result = app.state.gpu_pipeline.run(
-                video_path, cabinet_id=cabinet_id, person_flags=person_flags, area_model=app.state.area_model
-            )
-            best = accept_ranking(result["ranking"], result["track_points"])
-            return GPURecognitionResponse(
-                cabinet_id=cabinet_id,
-                status="ok" if best else "not_found",
-                product=f"product_{best['sku']}" if best else None,
-                confidence=round(best["combined"], 6) if best else None,
-                vector_score=round(best["vector"], 6) if best else None,
-                color_score=round(best["color"], 6) if best else None,
-                track_points=result["track_points"],
-                frames=result["frames"],
-                video_path=str(video_path.relative_to(ROOT)),
-                duration=round(time.monotonic() - start, 3),
-            )
-        except HTTPException:
-            raise
-        except ValueError as e:
-            LOG.warning("GPU 视频输入错误：%s", e)
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception:
-            LOG.exception("GPU 识别流程失败")
-            raise HTTPException(status_code=500, detail="GPU 识别失败，请查看容器日志")
         finally:
             video.file.close()

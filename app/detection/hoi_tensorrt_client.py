@@ -67,7 +67,7 @@ def validate_detection(result, expected_frames):
     return result
 
 
-def detect_video(video_path, expected_frames):
+def detect_video(video_path, expected_frames, areas=None):
     """发送共享目录内的视频路径，不传输视频帧或模型张量。"""
     path = Path(video_path)
     if not path.is_absolute():
@@ -77,7 +77,11 @@ def detect_video(video_path, expected_frames):
             session.trust_env = False
             response = session.post(
                 config.HOI_TENSORRT_URL + "/detect",
-                json={"video_path": str(path)},
+                json={
+                    "video_path": str(path),
+                    "area_missing_max_frames": config.hoi_area_missing_max_frames(),
+                    "areas": areas,
+                },
                 timeout=(config.HOI_TENSORRT_CONNECT_TIMEOUT, config.HOI_TENSORRT_REQUEST_TIMEOUT),
             )
             response.raise_for_status()

@@ -111,6 +111,10 @@ class Store:
                     result TEXT,
                     UNIQUE (owner, caller_id)
                 );
+                CREATE TABLE IF NOT EXISTS recognition_comparison (
+                    id TEXT PRIMARY KEY REFERENCES recognition(id),
+                    candidates TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS job (
                     id INTEGER PRIMARY KEY,
                     kind TEXT NOT NULL,
@@ -378,6 +382,24 @@ class Store:
                 "INSERT INTO recognition (id,owner,caller_id,body,candidates) VALUES (?,?,?,?,?)",
                 (recog_id, owner, caller_id, packed, encode(candidates)),
             )
+            comparisons = {
+                str(row["active_version"]): row["id"]
+                for row in db.execute(
+                    """
+                    SELECT sku.id, sku.active_version
+                    FROM sku JOIN sku_version AS active ON active.id=sku.active_version
+                    WHERE sku.deleted=0 AND active.state=2 AND active.features IS NOT NULL
+                      AND (sku.owner=? OR sku.standard=1)
+                    """,
+                    (owner,),
+                )
+                if str(row["active_version"]) not in candidates
+            }
+            if comparisons:
+                db.execute(
+                    "INSERT INTO recognition_comparison (id,candidates) VALUES (?,?)",
+                    (recog_id, encode(comparisons)),
+                )
             db.execute("INSERT INTO job (kind,ref) VALUES ('recognition',?)", (recog_id,))
             return recog_id
 
@@ -543,17 +565,25 @@ class Store:
                 event["comments"] = comments
             self._deliver(db, row["owner"], json.loads(row["body"]).get("notify_url"), event, delay)
 
-    def recognition_data(self, recog_id: str):
+    def recognition_data(self, recog_id: str) -> tuple[dict, dict[str, bytes], dict[str, bytes]]:
         with self.connection() as db:
-            row = db.execute("SELECT * FROM recognition WHERE id=?", (recog_id,)).fetchone()
-            candidates = json.loads(row["candidates"])
-            features = {
-                candidate_id: db.execute(
-                    "SELECT features FROM sku_version WHERE id=?", (version,)
-                ).fetchone()[0]
-                for version, candidate_id in candidates.items()
-            }
-        return json.loads(row["body"]), features
+            row = db.execute(
+                """
+                SELECT recognition.body, recognition.candidates,
+                       recognition_comparison.candidates AS comparisons
+                FROM recognition LEFT JOIN recognition_comparison USING (id)
+                WHERE recognition.id=?
+                """,
+                (recog_id,),
+            ).fetchone()
+            feature_query = """
+                SELECT snapshot.value, sku_version.features
+                FROM json_each(?) AS snapshot
+                JOIN sku_version ON sku_version.id=CAST(snapshot.key AS INTEGER)
+            """
+            features = dict(db.execute(feature_query, (row["candidates"],)))
+            comparisons = dict(db.execute(feature_query, (row["comparisons"],)))
+        return json.loads(row["body"]), features, comparisons
 
     def finish_recognition(self, job, result: dict, delay: float) -> None:
         with self.connection(write=True) as db:

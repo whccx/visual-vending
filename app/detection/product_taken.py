@@ -1,12 +1,14 @@
 """检测手是否携带商品连续离开货架。"""
 
 import math
-import statistics
+from typing import Literal
 
 import cv2
 import numpy as np
 
 from app import config
+
+DepartureEvidence = Literal["tracked", "sparse", "degenerate"]
 
 
 def _area(box):
@@ -95,9 +97,7 @@ def _dedupe_hands(hands):
 
 
 def _fill_missing_areas(frames):
-    """补全单帧货架漏检：矩形框用整段中位数，掩码用时间最近邻。"""
-    areas = [frame["area"] for frame in frames if frame.get("area") is not None]
-    stable_area = [statistics.median(box[index] for box in areas) for index in range(4)] if areas else None
+    """补全单帧货柜掩码漏检，外接框由掩码生成。"""
     forward = []
     last_mask = None
     for frame in frames:
@@ -116,9 +116,7 @@ def _fill_missing_areas(frames):
         dict(
             frame,
             area_mask=mask,
-            area=frame.get("area")
-            or (_mask_bbox(mask) if mask is not None else None)
-            or stable_area,
+            area=_mask_bbox(mask) if mask is not None and mask.any() else None,
         )
         for frame, mask in zip(frames, forward)
     ]
@@ -276,7 +274,7 @@ def _has_degenerate_area_departure_event(
     return False
 
 
-def is_product_taken(
+def product_departure_evidence(
     frames,
     *,
     near_area_ratio=None,
@@ -285,12 +283,12 @@ def is_product_taken(
     min_product_frames=None,
     max_hand_gap=None,
     sparse_event_max_gap=None,
-):
-    """判断是否同一只手携带商品连续离开货架。
+) -> DepartureEvidence | None:
+    """沿用拿取判定规则，返回命中的证据分支。
 
     `frames` 的每项含有 `area`、`hands` 和 `products`：货架和商品是矩形框，
     手项必须含 `box`。手轨迹必须先接近货架，随后距离连续增加；同时只有
-    外移阶段连续出现手旁商品时才返回 True。静止持物、靠近货架或单帧误检都
+    外移阶段连续出现手旁商品时才命中同手轨迹。静止持物、靠近货架或单帧误检都
     不会产生拿走事件。
     """
     near_area_ratio = config.taken_near_area_ratio() if near_area_ratio is None else near_area_ratio
@@ -368,7 +366,7 @@ def is_product_taken(
                 and track["product_steps"] >= min_product_frames
                 and gain >= gain_limit
             ):
-                return True
+                return "tracked"
     if _has_sparse_departure_event(
         frames,
         near_area_ratio,
@@ -376,14 +374,21 @@ def is_product_taken(
         min_product_frames,
         sparse_event_max_gap,
     ):
-        return True
-    return _has_degenerate_area_departure_event(
+        return "sparse"
+    if _has_degenerate_area_departure_event(
         frames,
         near_area_ratio,
         min_distance_gain_ratio,
         min_product_frames,
         sparse_event_max_gap,
-    )
+    ):
+        return "degenerate"
+    return None
+
+
+def is_product_taken(frames, **thresholds) -> bool:
+    """保留仅返回是否检测到拿取的接口。"""
+    return product_departure_evidence(frames, **thresholds) is not None
 
 
 def _detect_hands(frame, hands, gpu_hands):

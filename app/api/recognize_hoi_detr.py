@@ -13,9 +13,9 @@ from pydantic import Field
 
 from app import config
 from app.api.cabinet_validation import require_known_cabinet
-from app.api.recognize_100doh import Response100DOH, _save_upload
+from app.api.recognition_common import RecognitionResponse, save_upload
 from app.detection import camera_block
-from app.detection.hand_area_gate import filter_hand_linked_candidates
+from app.detection.hand_area_gate import cabinet_masks_for_candidates, filter_hand_linked_candidates
 from app.detection.hoi_tensorrt_client import (
     HOIDetectorError,
     HOIDetectorTimeout,
@@ -26,7 +26,7 @@ from app.detection.product_taken import (
     _detect_products,
     _fill_missing_areas,
     _near_hand,
-    is_product_taken,
+    product_departure_evidence,
 )
 from app.recognition.hoi_mask_matching import rank_masked_track
 from app.recognition.product_matching import accept_ranking
@@ -39,7 +39,7 @@ LOG = logging.getLogger("sku." + __name__)
 router = APIRouter()
 
 
-class ResponseHOI(Response100DOH):
+class ResponseHOI(RecognitionResponse):
     """HOI 识别结果及可选的掩码检查目录。"""
 
     status: str = Field(
@@ -54,7 +54,7 @@ class ResponseHOI(Response100DOH):
     debug_dir: str | None = None
 
 
-def _judge_frames(detection):
+def _judge_frames(detection, masks=None):
     """把 HOI 逐帧检测结果整理成拿走判定所需的帧结构。
 
     只有原始检出货柜的帧，其商品才参与判定，且商品必须与手关联、面积不超过
@@ -67,7 +67,11 @@ def _judge_frames(detection):
         return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
 
     frames = []
-    for area, hands, objects in zip(detection["areas"], detection["hands"], detection["frames"]):
+    if masks is None:
+        masks = [None] * len(detection["areas"])
+    for area, hands, objects, mask in zip(
+        detection["areas"], detection["hands"], detection["frames"], masks
+    ):
         products = []
         if area is not None:
             for obj in objects:
@@ -77,7 +81,7 @@ def _judge_frames(detection):
                 hand_area = max(box_area(hand["box"]) for hand in linked)
                 if box_area(obj["box"]) <= ratio * hand_area:
                     products.append(obj["box"])
-        frames.append({"area": area, "hands": hands, "products": products})
+        frames.append({"area": area, "area_mask": mask, "hands": hands, "products": products})
     return frames
 
 
@@ -144,7 +148,7 @@ def _supplement_frames(video_path, raw_frames, frames, state):
     return added_hands, added_products, added_masks, scanned
 
 
-def _classify_without_match(detection, video_path, state):
+def _classify_without_match(detection, video_path, state, masks=None):
     """未识别出商品时细分状态：未知商品 / 未开柜门 / 开门未拿商品。
 
     直接复用 HOI TensorRT 的逐帧货柜框、手框和商品框喂给拿走判定，
@@ -154,11 +158,12 @@ def _classify_without_match(detection, video_path, state):
     """
     area_frames = sum(area is not None for area in detection["areas"])
     try:
-        raw_frames = _judge_frames(detection)
-        frames = _fill_missing_areas(raw_frames)
-        taken = is_product_taken(frames)
-        if not taken and area_frames >= config.hoi_door_min_area_frames():
+        raw_frames = _judge_frames(detection, masks)
+        frames = _fill_missing_areas([dict(frame) for frame in raw_frames])
+        departure = product_departure_evidence(frames)
+        if departure is None and area_frames >= config.hoi_door_min_area_frames():
             try:
+                frames = [dict(frame) for frame in raw_frames]
                 added_hands, added_products, added_masks, scanned = _supplement_frames(
                     video_path, raw_frames, frames, state
                 )
@@ -172,15 +177,15 @@ def _classify_without_match(detection, video_path, state):
                     "手旁持物商品 %s 个、区域掩码 %s 帧",
                     scanned, added_hands, added_products, added_masks,
                 )
-                taken = is_product_taken(frames)
+                departure = product_departure_evidence(frames)
     except Exception:
         LOG.exception("HOI-DETR 拿走判定失败，状态回退为 not_found")
-        return "not_found", area_frames
-    if taken:
-        return "unknown_product", area_frames
+        return "not_found", area_frames, None
+    if departure is not None:
+        return "unknown_product", area_frames, departure
     if area_frames < config.hoi_door_min_area_frames():
-        return "door_not_opened", area_frames
-    return "door_opened_no_taken", area_frames
+        return "door_not_opened", area_frames, None
+    return "door_opened_no_taken", area_frames, None
 
 
 @router.post(
@@ -204,7 +209,7 @@ def recognize_hoi_detr(
         request: 当前请求，提供共享模型和区域检测状态。
         video: 上传的视频文件。
     返回：
-        包含商品候选、分数、轨迹点数和耗时的 Response100DOH。
+        包含商品候选、分数、轨迹点数和耗时的 RecognitionResponse。
     异常：
         输入无效时返回 HTTP 400，检测超时返回 HTTP 504，其他识别错误返回 HTTP 500。
     """
@@ -224,7 +229,7 @@ def recognize_hoi_detr(
     with RESOURCE_LOCK, tempfile.TemporaryDirectory(prefix="job_hoi_detr_", dir=JOBS) as tmp:
         try:
             job = Path(tmp)
-            video_path = _save_upload(video, original, job, cabinet_id)
+            video_path = save_upload(video, original, job, cabinet_id)
             probe = cv2.VideoCapture(str(video_path))
             try:
                 if not probe.isOpened() or not probe.read()[0]:
@@ -234,8 +239,17 @@ def recognize_hoi_detr(
                 frame_count = int(probe.get(cv2.CAP_PROP_FRAME_COUNT))
             finally:
                 probe.release()
-            detection = detect_video(video_path, frame_count)
+            from app.detection import area_detection
+            if not hasattr(request.app.state, "area_model"):
+                request.app.state.area_model = area_detection.load_model()
+            areas, packed_masks, shape = area_detection.detect_video_masks(
+                video_path, request.app.state.area_model
+            )
+            detection = detect_video(video_path, frame_count, areas)
             LOG.info("HOI TensorRT 检测耗时：%s", detection.get("timings"))
+            masks = cabinet_masks_for_candidates(
+                packed_masks, shape, detection["hands"], detection["frames"]
+            )
             frames, hand_area = filter_hand_linked_candidates(
                 detection["hands"],
                 detection["frames"],
@@ -244,6 +258,7 @@ def recognize_hoi_detr(
                 require_departure=True,
                 hand_track_base_distance=config.hoi_hand_track_base_distance(),
                 hand_track_iou_threshold=config.hoi_hand_track_iou_threshold(),
+                area_masks_by_frame=masks,
             )
             LOG.info("HOI-DETR 手部区域筛选统计：%s", hand_area)
             primary, motion_summary = select_visually_moving_track(video_path, frames)
@@ -268,7 +283,9 @@ def recognize_hoi_detr(
             best = accept_ranking(ranking, count)
             status = "ok"
             if not best:
-                status, area_frames = _classify_without_match(detection, video_path, request.app.state)
+                status, area_frames, _ = _classify_without_match(
+                    detection, video_path, request.app.state, masks
+                )
                 LOG.info(
                     "HOI-DETR 未识别出商品，细分状态：%s（货柜检出帧数=%s）", status, area_frames
                 )

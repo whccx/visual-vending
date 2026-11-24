@@ -117,12 +117,10 @@ class Detector:
         self.logger = trt.Logger(trt.Logger.WARNING)
         trt.init_libnvinfer_plugins(self.logger, "")
         self.model_dir = model_dir
-        self.shelf = Engine(model_dir / "shelf_384x640.engine", self.logger)
         self.hoi = Engine(model_dir / "hoi_full_safe_fp16.engine", self.logger)
         self.relations = {}
 
     def warmup(self):
-        self.shelf.infer(np.zeros((1, 3, 384, 640), np.float32))
         self.hoi.infer(np.zeros((1, 3, 480, 800), np.float32))
         self.relations[1] = Engine(self.model_dir / "hoi_relation.engine", self.logger, (1, 512))
         self.relations[1].infer(np.zeros((1, 512), np.float32))
@@ -155,7 +153,7 @@ class Detector:
                 [{"box": xyxy[k].tolist(), "score": float(scores[k]),
                   "hand_indices": np.flatnonzero(links[i]).tolist()} for i, k in enumerate(objects)])
 
-    def detect(self, path):
+    def detect(self, path, area_missing_max_frames=375, area_masks_boxes=None):
         """返回与输入逐帧对齐的检测结果和阶段耗时。"""
         capture = cv2.VideoCapture(str(path))
         if not capture.isOpened():
@@ -163,6 +161,8 @@ class Detector:
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         frames, hands, areas = [], [], []
         elapsed_shelf = elapsed_hoi = elapsed_post = 0.0
+        missing_frames = 0
+        seen_area = False
         started = time.monotonic()
         try:
             while True:
@@ -171,15 +171,23 @@ class Detector:
                     break
                 if image.shape != (1080, 1920, 3):
                     raise ValueError("当前引擎仅支持 1920×1080 视频")
-                data = shelf_input(image)
                 step = time.monotonic()
-                area = shelf_box(self.shelf.infer(data)["output0"])
+                if area_masks_boxes is None:
+                    raise ValueError("缺少货柜分割结果")
+                if len(areas) >= len(area_masks_boxes):
+                    raise ValueError("货柜掩码帧数少于视频")
+                area = area_masks_boxes[len(areas)]
                 elapsed_shelf += time.monotonic() - step
                 areas.append(area)
                 if area is None:
-                    frames.append([])
-                    hands.append([])
-                    continue
+                    missing_frames += 1
+                    if not seen_area or missing_frames > area_missing_max_frames:
+                        frames.append([])
+                        hands.append([])
+                        continue
+                else:
+                    seen_area = True
+                    missing_frames = 0
                 data = hoi_input(image)
                 step = time.monotonic()
                 output = self.hoi.infer(data)
@@ -193,6 +201,8 @@ class Detector:
             capture.release()
         if not frames:
             raise ValueError("视频没有可解码的帧")
+        if area_masks_boxes is not None and len(area_masks_boxes) != len(frames):
+            raise ValueError("货柜掩码帧数与视频不一致")
         return {"frame_count": len(frames), "fps": fps, "width": 1920, "height": 1080,
                 "areas": areas, "hands": hands, "frames": frames,
                 "timings": {"total_seconds": time.monotonic() - started,
@@ -203,4 +213,3 @@ class Detector:
         for engine in self.relations.values():
             engine.close()
         self.hoi.close()
-        self.shelf.close()

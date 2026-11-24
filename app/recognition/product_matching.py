@@ -2,7 +2,9 @@
 
 import logging
 import math
+from collections.abc import Collection
 from decimal import Decimal
+from typing import Literal
 
 import numpy as np
 import torch
@@ -37,6 +39,7 @@ def prepare_catalog(catalog):
 
 def score_crop(
     crop, mask, model, catalog, mean, std, *, reference_hues=None, hue_rgb=None, hue_mask=None,
+    color_crop=None,
 ):
     """对掩码裁剪图提取向量及颜色特征，并计算各商品的相似度。
 
@@ -56,7 +59,7 @@ def score_crop(
         .div_(255)
     )
     query = F.normalize(model(pixel_values=(resized - mean) / std).pooler_output, dim=1)[0]
-    full_color = descriptor(crop, mask) if reference_hues is None else None
+    full_color = descriptor(crop if color_crop is None else color_crop, mask) if reference_hues is None else None
     scores = {}
     for sku in features:
         vector = torch.maximum(query @ centroids[sku], (features[sku] @ query).max())
@@ -112,7 +115,7 @@ def hue_frame_scores(rgb, mask, scores, reference_hues):
     }
 
 
-def select_scoring_window(scored_frames, skus):
+def select_scoring_window(scored_frames, skus, *, sku_scope: Collection[int] | None = None):
     """从连续有效帧窗口中选综合分前两名间隔最大的窗口。"""
     by_frame = dict(scored_frames)
     size = config.SCORE_WINDOW_FRAMES
@@ -124,6 +127,15 @@ def select_scoring_window(scored_frames, skus):
         ranking = rank_scores([by_frame[frame] for frame in frames], skus)
         if not ranking:
             continue
+        best = ranking[0]["sku"]
+        if sku_scope is not None and best not in sku_scope:
+            # 范围外商品在窗口的每帧都必须有更强的向量证据。
+            if not all(
+                by_frame[frame][best][0] > by_frame[frame][sku][0]
+                for frame in frames
+                for sku in sku_scope
+            ):
+                continue
         margin = ranking[0]["combined"] - ranking[1]["combined"] if len(ranking) > 1 else 0.0
         candidates.append((margin, -start, frames, ranking))
     if not candidates:
@@ -132,23 +144,27 @@ def select_scoring_window(scored_frames, skus):
     return frames, ranking
 
 
-def accept_ranking(ranking, count):
-    """根据轨迹点数、向量分数、颜色分数及前两名差距筛选最佳商品。
-
-    参数：
-        ranking: rank_scores 生成的降序候选列表。
-        count: 参与识别的轨迹点数。
-    返回：
-        满足门槛的第一名候选；否则返回 None。
-    """
+def ranking_rejection_reason(
+    ranking, count
+) -> Literal["insufficient_evidence", "unmatched_scores", "ambiguous_margin"] | None:
+    """按现有匹配规则返回拒识原因，满足所有门槛时返回 None。"""
     if not ranking or count < config.SCORE_WINDOW_FRAMES:
-        return None
+        return "insufficient_evidence"
     best = ranking[0]
     vector, color = float(best["vector"]), float(best["color"])
-    if not math.isfinite(vector) or vector < config.min_vector_score():
-        return None
-    if not math.isfinite(color) or color < config.min_color_score():
-        return None
+    first = float(best["combined"])
+    second = float(ranking[1]["combined"]) if len(ranking) > 1 else None
+    if not all(math.isfinite(score) for score in (vector, color, first)):
+        return "insufficient_evidence"
+    if second is not None and not math.isfinite(second):
+        return "insufficient_evidence"
+    if (
+        second is not None
+        and Decimal(str(first)) - Decimal(str(second)) < Decimal(str(config.SCORE_MIN_MARGIN))
+    ):
+        return "ambiguous_margin"
+    if vector < config.min_vector_score() or color < config.min_color_score():
+        return "unmatched_scores"
     # 多个商品的色相分都接近满分时，颜色无法提供有效的区分证据。
     if color >= config.SCORE_AMBIGUOUS_HUE_THRESHOLD:
         similar_colors = sum(
@@ -158,13 +174,10 @@ def accept_ranking(ranking, count):
         )
         if similar_colors >= config.SCORE_AMBIGUOUS_HUE_COUNT:
             LOG.info("商品匹配拒识：%s 个候选商品色相高度相似", similar_colors)
-            return None
-    if len(ranking) > 1:
-        first, second = float(best["combined"]), float(ranking[1]["combined"])
-        if (
-            not math.isfinite(first)
-            or not math.isfinite(second)
-            or Decimal(str(first)) - Decimal(str(second)) < Decimal("0.03")
-        ):
-            return None
-    return best
+            return "insufficient_evidence"
+    return None
+
+
+def accept_ranking(ranking, count):
+    """返回满足匹配门槛的第一名候选。"""
+    return ranking[0] if ranking_rejection_reason(ranking, count) is None else None

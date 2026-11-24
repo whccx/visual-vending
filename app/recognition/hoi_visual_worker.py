@@ -78,8 +78,14 @@ def recognize_video(video, cabinet_id, dino, state, gate):
             detail = (job / 'worker.log').read_text(errors='replace')[-4000:]
             raise RuntimeError(f'HOI-DETR 检测失败：{detail}')
         detection = json.loads(output.read_text(encoding='utf-8'))
-    areas = area_detection.get_area_boxes(video, state)
-    frames, _ = filter_hand_linked_candidates(detection['hands'], detection['frames'], areas)
+    if not hasattr(state, 'area_model'):
+        state.area_model = area_detection.load_model()
+    areas, packed_masks, shape = area_detection.detect_video_masks(video, state.area_model)
+    from app.detection.hand_area_gate import cabinet_masks_for_candidates
+    masks = cabinet_masks_for_candidates(packed_masks, shape, detection['hands'], detection['frames'])
+    frames, _ = filter_hand_linked_candidates(
+        detection['hands'], detection['frames'], areas, area_masks_by_frame=masks
+    )
     primary, _ = select_visually_moving_track(video, frames)
     if primary:
         # 与 HOI 接口一致：靠近画面边缘的残片不参与匹配。

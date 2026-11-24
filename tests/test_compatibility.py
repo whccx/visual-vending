@@ -248,9 +248,80 @@ def test_gpu_pipeline_preserves_external_sku_mapping(monkeypatch):
     pipeline = Pipeline()
     view = Mock(return_value=outcome(2, items=[{"ks_sku_id": "001", "sku_num": 1}]))
     monkeypatch.setattr(pipeline, "_recognize_view", view)
-    pipeline.recognize([Path("cabinet.mp4")], "A", {"001": b"one", "002": b"two"})
-    assert view.call_args.args[2] == {1: {"features": b"one"}, 2: {"features": b"two"}}
+    pipeline.recognize(
+        [Path("cabinet.mp4")],
+        "A",
+        {"001": b"one", "002": b"two"},
+        comparison_assets={"outside": b"three"},
+    )
+    assert view.call_args.args[2] == {
+        1: {"features": b"one"},
+        2: {"features": b"two"},
+        3: {"features": b"three"},
+    }
     assert view.call_args.args[3] == {1: "001", 2: "002"}
+
+
+def test_gpu_pipeline_requires_agreement_on_out_of_scope_result(monkeypatch):
+    from vending.engine import Pipeline
+
+    pipeline = Pipeline()
+    monkeypatch.setattr(
+        pipeline, "_recognize_view", Mock(side_effect=[outcome(7), outcome(4)])
+    )
+    result = pipeline.recognize([Path("main.mp4"), Path("aux.mp4")], "A", {})
+    assert result["status"]["code"] == 4
+
+
+def test_cabinet_gate_measures_distance_to_segmentation_mask():
+    import numpy as np
+
+    from app.detection.hand_area_gate import filter_hand_linked_candidates
+
+    mask = np.zeros((240, 240), dtype=bool)
+    mask[10:20, 10:20] = True
+    mask[220:230, 220:230] = True
+    hand = {"box": [110, 110, 120, 120]}
+    candidate = {"box": [110, 110, 120, 120], "hand_indices": [0], "score": 0.9}
+    hands = [[hand], [hand]]
+    candidates = [[candidate], [candidate]]
+    boxes = [[10, 10, 230, 230]] * 2
+
+    _, box_result = filter_hand_linked_candidates(hands, candidates, boxes)
+    _, mask_result = filter_hand_linked_candidates(
+        hands, candidates, boxes, area_masks_by_frame=[mask, mask]
+    )
+    assert box_result["taken_tracks"] == 1
+    assert mask_result["taken_tracks"] == 0
+
+
+def test_unmatched_cabinet_mask_frames_must_align():
+    from app.detection.hand_area_gate import cabinet_masks_for_candidates
+
+    with pytest.raises(ValueError, match="帧数不一致"):
+        cabinet_masks_for_candidates([], (10, 10), [[]], [[]])
+
+
+@pytest.mark.parametrize(
+    "status,departure,taken_tracks,door_opened,code,comments",
+    [
+        ("door_not_opened", None, 0, False, 3, "未开门"),
+        ("door_opened_no_taken", None, 0, True, 3, "开门未拿商品"),
+        ("unknown_product", "degenerate", 0, True, 3, "开门未拿商品"),
+        ("unknown_product", "degenerate", 0, False, 4, None),
+        ("unknown_product", "degenerate", 1, True, 4, "拿取后缺少可用于识别商品的有效轨迹"),
+        ("unknown_product", "tracked", 0, True, 4, "拿取后缺少可用于识别商品的有效轨迹"),
+        ("unknown_product", "sparse", 0, True, 4, None),
+        ("not_found", None, 1, True, 4, None),
+    ],
+)
+def test_unmatched_video_status_mapping(status, departure, taken_tracks, door_opened, code, comments):
+    from vending.engine import unmatched_video_result
+
+    result = unmatched_video_result(status, departure, taken_tracks, door_opened=door_opened)
+    assert result["status"]["code"] == code
+    if comments is not None:
+        assert result["comments"] == comments
 
 
 def test_documented_operations_and_callback_schema(context):
@@ -271,6 +342,36 @@ def test_queued_recognition_keeps_original_catalog_version(context):
     signed(client, "DELETE", PREFIX + "/sku/001")
     assert db.recognition_data(ident)[1] == {"001": b"old"}
     assert signed(client, "GET", PREFIX + "/sku/skus/001").status_code == 400
+
+
+def test_recognition_snapshots_visible_comparison_versions_and_excludes_scope_alias(context):
+    client, db, _ = context
+    db.import_sku(
+        owner="demo", caller_id="inside", sku_id="001", info=sku_body(),
+        features=b"inside", aliases=["inside-alias"],
+    )
+    db.import_sku(
+        owner="demo", caller_id="outside", sku_id="002", info=sku_body(), features=b"outside",
+    )
+    db.import_sku(
+        owner="other", caller_id="private", sku_id="003", info=sku_body(), features=b"private",
+    )
+    db.import_sku(
+        owner="", caller_id="public", sku_id="004", info=sku_body(),
+        features=b"public", standard=True,
+    )
+
+    response = signed(client, "POST", PREFIX + "/recognition", task_body("inside-alias"))
+    ident = response.json()["data"]["ks_recog_id"]
+    assert signed(client, "DELETE", PREFIX + "/sku/002").status_code == 200
+
+    _, scope, comparison = db.recognition_data(ident)
+    assert scope == {"inside-alias": b"inside"}
+    assert comparison == {"002": b"outside", "004": b"public"}
+
+    with db.connection(write=True) as conn:
+        conn.execute("DELETE FROM recognition_comparison WHERE id=?", (ident,))
+    assert db.recognition_data(ident)[1:] == (scope, {})
 
 
 def test_catalog_import_can_retry_without_changing_existing_sku(context):

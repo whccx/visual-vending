@@ -18,8 +18,6 @@ LOCAL_MODEL = LOCAL_ROOT / MODEL_PATH
 AREA_MODEL = ROOT / "models/cabinet_area/best.pt"
 RESTORE_DATA_DIR = ROOT / ".sku_restore"
 GPU_RUNTIME = ROOT / "runtime/gpu"
-DOH_EXPERIMENT = ROOT / "runtime/100doh"
-DOH_CHECKPOINT = DOH_EXPERIMENT / "models/handobj_100K_ego.pth"
 HOI_REPO = ROOT / "runtime/hoi_detr/HOI-DETR"
 HOI_PYTHON = ROOT / "runtime/hoi_detr/env/bin/python"
 HOI_MODEL = ROOT / "models/hoi-detr/epoch_5.pth"
@@ -50,6 +48,7 @@ HOI_MASK_MATCH_MIN_FRACTION = 0.40
 
 # 商品识别使用连续帧窗口，按窗口内前两名综合分差筛选。
 SCORE_WINDOW_FRAMES = 5
+SCORE_MIN_MARGIN = 0.04
 
 # 多个商品的色相分数同时过高时，颜色证据无法可靠区分商品，保守拒识。
 SCORE_AMBIGUOUS_HUE_THRESHOLD = 0.98 # color 分达到该值视为"色相高度相似"
@@ -133,6 +132,11 @@ def hoi_hand_track_base_distance() -> float:
 def hoi_hand_track_iou_threshold() -> float:
     """HOI 手部轨迹关联中，中心位移超限时的手框 IoU 兜底阈值。"""
     return float(os.environ.get("SKU_HOI_HAND_TRACK_IOU_THRESHOLD", "0.15"))
+
+
+def hoi_area_missing_max_frames() -> int:
+    """连续货柜漏检时继续执行手和商品检测的最大帧数。"""
+    return max(0, int(os.environ.get("SKU_HOI_AREA_MISSING_MAX_FRAMES", "375")))
 
 
 def hoi_door_min_area_frames() -> int:
@@ -225,10 +229,6 @@ def hand_backend() -> str:
 
 def gpu_batch_size() -> int:
     return int(os.environ.get("SKU_GPU_BATCH_SIZE", "16"))
-
-
-def doh_workers() -> int:
-    return int(os.environ.get("SKU_100DOH_WORKERS", "4"))
 
 
 def hoi_detr_batch_size() -> int:

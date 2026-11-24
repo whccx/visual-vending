@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import time
+from collections.abc import Collection
 from pathlib import Path
 
 import cv2
@@ -21,7 +22,6 @@ from app.recognition.frame_orientation import (
     rotate_frame_and_box,
 )
 from app.recognition.product_matching import (
-    hue_frame_scores as _hue_frame_scores,
     prepare_catalog,
     score_crop,
     select_scoring_window as _select_scoring_window,
@@ -259,6 +259,7 @@ def _reject_small_mask(item):
 def rank_masked_track(
     video, primary, model, cabinet_id, state, save_debug=False,
     saved_features=None, matching_catalog=None, use_trt_bg0=False,
+    *, sku_scope: Collection[int] | None = None,
 ):
     """仅处理最终选中轨迹，分割或修复后计算商品匹配分数。"""
     points = {int(point["frame"]): point["box"] for point in (primary or {}).get("points", [])}
@@ -364,7 +365,6 @@ def rank_masked_track(
     if saved_features is None:
         saved_features = load_features(cabinet_id)
     catalog = matching_catalog if matching_catalog is not None else prepare_catalog(saved_features)
-    reference_hues = {sku: entry["colors"] for sku, entry in saved_features.items()}
     scores = []
     mean = torch.tensor([0.485, 0.456, 0.406], device="cuda")[None, :, None, None]
     std = torch.tensor([0.229, 0.224, 0.225], device="cuda")[None, :, None, None]
@@ -392,15 +392,16 @@ def rank_masked_track(
                 raise OSError(f"第 {frame} 帧掩码保存失败")
         if catalog[0]:
             crop_tensor = torch.from_numpy(enhanced).cuda().permute(2, 0, 1)
+            color_tensor = torch.from_numpy(rgb).cuda().permute(2, 0, 1)
             mask_tensor = torch.from_numpy(np.ascontiguousarray(mask)).cuda()
             with torch.inference_mode():
                 _, frame_scores = score_crop(
                     crop_tensor, mask_tensor, model, catalog, mean, std,
-                    reference_hues=reference_hues, hue_rgb=enhanced, hue_mask=mask,
+                    color_crop=color_tensor,
                 )
             scores.append((frame, frame_scores))
         frame_report.append(detail)
-    selected_frames, ranking = _select_scoring_window(scores, catalog[0])
+    selected_frames, ranking = _select_scoring_window(scores, catalog[0], sku_scope=sku_scope)
     if debug_dir:
         for frame in selected_frames:
             name = f"{frame:06d}.png"

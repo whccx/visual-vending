@@ -23,7 +23,7 @@ from app.recognition.product_matching import (
 from app.detection.person_gate_policy import PersonGatePolicy
 from app.tracking.stable_trajectory import select_stable_track
 from app.detection.hand_area_gate import filter_hand_linked_candidates
-from app.detection.area_detection import detect_frame_box
+from app.detection.area_detection import detect_frame_mask
 
 # GPU 视频依赖保存在运行时目录，重建容器后仍可使用。
 from app import config
@@ -122,14 +122,18 @@ class GPUVideoPipeline:
             person_flags = None
         if area_boxes is not None and len(area_boxes) != count:
             raise ValueError("柜内区域检测与视频帧数不一致")
+        if area_boxes is not None and area_model is None:
+            from app.detection.area_detection import load_model
+            area_model = load_model()
+            area_boxes = None
         if area_model is not None:
             if area_boxes is not None:
                 raise ValueError("不能同时提供区域模型和区域检测结果")
             area_boxes = [None] * count
+        area_masks = [None] * count if area_model is not None else None
         gate = PersonGatePolicy(person_flags)
         catalog = load_features(cabinet_id)
         matching_catalog = prepare_catalog(catalog)
-        reference_hues = {sku: item["colors"] for sku, item in catalog.items()}
         features = matching_catalog[0]
         torch.cuda.synchronize()
         # 三个有界队列连接处理阶段；停止事件用于向其他线程传播异常。
@@ -251,7 +255,7 @@ class GPUVideoPipeline:
                 metrics["readback"] += rgb.nbytes
                 im = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
                 if area_model is not None:
-                    area_boxes[idx], _ = detect_frame_box(im, area_model)
+                    area_masks[idx], area_boxes[idx] = detect_frame_mask(im, area_model)
                 for k in range(4):
                     detected_hands = gpu_hand_angle(im, k, self.hands)
                     for hand in detected_hands:
@@ -351,7 +355,6 @@ class GPUVideoPipeline:
                             raise ValueError("商品分割区域为空")
                         q, rank = score_crop(
                             crop, mask, self.dino, matching_catalog, mean, std,
-                            reference_hues=reference_hues,
                         )
                         embeddings[idx + 1] = q.detach().cpu().numpy()
                         metrics["scoring_readback"] += (
@@ -414,7 +417,8 @@ class GPUVideoPipeline:
                 for i, box in enumerate(rows)
             ]
             eligible, hand_area = filter_hand_linked_candidates(
-                hands_by_frame, hand_candidates, area_boxes, embeddings_by_frame=embeddings
+                hands_by_frame, hand_candidates, area_boxes, embeddings_by_frame=embeddings,
+                area_masks_by_frame=area_masks,
             )
             gated_rows = [items[0]["box"] if items else None for items in eligible]
             gated_track_ids = [items[0]["area_track_id"] if items else None for items in eligible]

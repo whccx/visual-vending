@@ -56,6 +56,24 @@ def _cosine(a, b):
     return value if math.isfinite(value) else None
 
 
+def cabinet_masks_for_candidates(packed_masks, shape, hands_by_frame, candidates_by_frame):
+    """还原有手商品关联帧的货柜掩码，复用统一分割结果。"""
+    import numpy as np
+
+    if not (len(packed_masks) == len(hands_by_frame) == len(candidates_by_frame)):
+        raise ValueError("货柜掩码与检测帧数不一致")
+    masks = [None] * len(hands_by_frame)
+    for index, (packed, hands, candidates) in enumerate(
+        zip(packed_masks, hands_by_frame, candidates_by_frame)
+    ):
+        if packed is not None and any(
+            _linked_hands(candidate, hands, {i: i for i in range(len(hands))})
+            for candidate in candidates
+        ):
+            masks[index] = np.unpackbits(packed, count=shape[0] * shape[1]).reshape(shape).astype(bool)
+    return masks
+
+
 def filter_hand_linked_candidates(
     hands_by_frame,
     candidates_by_frame,
@@ -67,6 +85,7 @@ def filter_hand_linked_candidates(
     require_departure=False,
     hand_track_base_distance=70.0,
     hand_track_iou_threshold=None,
+    area_masks_by_frame=None,
 ):
     """筛选从柜体附近建立并确认的手部关联商品轨迹。
 
@@ -91,6 +110,28 @@ def filter_hand_linked_candidates(
     """
     if not (len(hands_by_frame) == len(candidates_by_frame) == len(areas_by_frame)):
         raise ValueError("手部、商品与柜内区域帧数不一致")
+    if area_masks_by_frame is not None and len(area_masks_by_frame) != len(areas_by_frame):
+        raise ValueError("货柜掩码与视频帧数不一致")
+    if area_masks_by_frame is not None:
+        from app.detection.product_taken import _hand_area_distance, _mask_bbox
+
+        mask_frames = [{"area_mask": mask} for mask in area_masks_by_frame]
+        areas_by_frame = [_mask_bbox(mask) if mask is not None and mask.any() else None
+                          for mask in area_masks_by_frame]
+    else:
+        mask_frames = None
+
+    last_distance_index = None
+
+    def area_distance(index, box, area):
+        nonlocal last_distance_index
+        if mask_frames is not None:
+            if last_distance_index is not None and last_distance_index != index:
+                mask_frames[last_distance_index].pop("_area_dist", None)
+            last_distance_index = index
+            return _hand_area_distance(mask_frames[index], box, area)
+        return box_distance(box, area)
+
     hands_tracks = []
     frame_hand_ids = []
     for frame_index, (hands, area) in enumerate(zip(hands_by_frame, areas_by_frame)):
@@ -149,7 +190,10 @@ def filter_hand_linked_candidates(
                 diagonal = math.hypot(area[2] - area[0], area[3] - area[1])
                 if (
                     diagonal > 0
-                    and box_distance(hand["box"], area) <= near_ratio * diagonal
+                    and area_distance(frame_index, hand["box"], area) <= (
+                        config.taken_mask_near_distance() if mask_frames is not None
+                        else near_ratio * diagonal
+                    )
                     and track["first_near"] is None
                 ):
                     track["first_near"] = frame_index
@@ -195,7 +239,10 @@ def filter_hand_linked_candidates(
                 track_id
                 for track_id, _ in linked_hands
                 if area is not None
-                and box_distance(box, area) <= near_ratio * diagonal
+                and area_distance(frame_index, box, area) <= (
+                    config.taken_mask_near_distance() if mask_frames is not None
+                    else near_ratio * diagonal
+                )
                 and hands_tracks[track_id]["first_near"] is not None
                 and hands_tracks[track_id]["first_near"] <= frame_index
             ]
@@ -283,8 +330,12 @@ def filter_hand_linked_candidates(
                 hand = next(
                     hand for track_id, hand in linked_hands if track_id == track["hand_track_id"]
                 )
-                hand_distance = box_distance(hand, area)
-                if hand_distance <= near_ratio * diagonal:
+                hand_distance = area_distance(frame_index, hand, area)
+                near_limit = (config.taken_mask_near_distance() if mask_frames is not None
+                              else near_ratio * diagonal)
+                gain_limit = (config.taken_mask_gain_distance() if mask_frames is not None
+                              else config.taken_min_distance_gain_ratio() * diagonal)
+                if hand_distance <= near_limit:
                     track["near_distance"] = (
                         hand_distance
                         if track["near_distance"] is None
@@ -305,7 +356,7 @@ def filter_hand_linked_candidates(
                         track["outward_steps"] >= config.taken_min_outward_steps()
                         and track["product_steps"] >= config.taken_min_product_frames()
                         and hand_distance - track["near_distance"]
-                        >= config.taken_min_distance_gain_ratio() * diagonal
+                        >= gain_limit
                     ):
                         track["taken"] = True
 

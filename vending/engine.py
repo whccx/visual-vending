@@ -39,6 +39,21 @@ def unpack_features(data: bytes) -> dict:
         return {key: arrays[key] for key in ("features", "colors", "full_colors")}
 
 
+def unmatched_video_result(
+    status: str, departure: str | None, taken_tracks: int, *, door_opened: bool
+) -> dict:
+    """将既有开门与离架判定转换为 OpenAPI 的识别结果。"""
+    if taken_tracks == 0:
+        if status == "door_not_opened":
+            return outcome(3, "未开门")
+        # 异常柜框兜底只有位移线索，开门已确认时不把它作为可靠拿取依据。
+        if status == "door_opened_no_taken" or (door_opened and departure == "degenerate"):
+            return outcome(3, "开门未拿商品")
+    if departure == "tracked" or taken_tracks > 0:
+        return outcome(4, "拿取后缺少可用于识别商品的有效轨迹")
+    return outcome(4, "未获得足够的商品离架或身份匹配证据")
+
+
 def probe_video(path: Path) -> tuple[int, int, int, float]:
     import cv2
 
@@ -150,16 +165,26 @@ class Pipeline:
         features, colors = features_for_images(images, model=self.dino)
         return pack_features(features, colors, np.asarray(full_colors, dtype=np.float32))
 
-    def recognize(self, videos: list[Path], cabinet_id: str, assets: dict[str, bytes]) -> dict:
+    def recognize(
+        self,
+        videos: list[Path],
+        cabinet_id: str,
+        assets: dict[str, bytes],
+        *,
+        comparison_assets: dict[str, bytes] | None = None,
+    ) -> dict:
         catalog = {
-            index: unpack_features(data) for index, data in enumerate(assets.values(), start=1)
+            index: unpack_features(data)
+            for index, data in enumerate(
+                [*assets.values(), *(comparison_assets or {}).values()], start=1
+            )
         }
         sku_ids = dict(enumerate(assets, start=1))
         views = [self._recognize_view(path, cabinet_id, catalog, sku_ids) for path in videos]
         primary = views[0]
         if len(views) == 1:
             return primary
-        if primary["status"]["code"] not in (2, 3):
+        if primary["status"]["code"] not in (2, 3, 7):
             return primary
         if any(
             view["status"]["code"] != primary["status"]["code"]
@@ -172,18 +197,29 @@ class Pipeline:
     def _recognize_view(self, path: Path, cabinet_id: str, catalog: dict, sku_ids: dict) -> dict:
         from app import config
         from app.api.recognize_hoi_detr import _classify_without_match
-        from app.detection import camera_block
-        from app.detection.hand_area_gate import filter_hand_linked_candidates
+        from app.detection import area_detection, camera_block
+        from app.detection.hand_area_gate import (
+            cabinet_masks_for_candidates,
+            filter_hand_linked_candidates,
+        )
         from app.detection.hoi_tensorrt_client import detect_video
         from app.recognition.hoi_mask_matching import rank_masked_track
-        from app.recognition.product_matching import accept_ranking, prepare_catalog
+        from app.recognition.product_matching import prepare_catalog, ranking_rejection_reason
         from app.tracking.hoi_detr_motion import inspect_video_motion
         from app.tracking.trajectory_hoi_detr import build_visual_motion_tracks
 
         width, height, count, _ = probe_video(path)
-        detection = detect_video(path, count)
+        if not hasattr(self, "area_model"):
+            self.area_model = area_detection.load_model()
+        areas, packed_masks, shape = area_detection.detect_video_masks(path, self.area_model)
+        if len(areas) != count:
+            raise ValueError("货柜分割帧数与视频不一致")
+        detection = detect_video(path, count, areas)
         if camera_block.judge_camera_blocked(path, detection["areas"]):
             return outcome(6, "检测到与柜门状态不一致的持续遮挡，需复核")
+        masks = cabinet_masks_for_candidates(
+            packed_masks, shape, detection["hands"], detection["frames"]
+        )
         frames, gate = filter_hand_linked_candidates(
             detection["hands"],
             detection["frames"],
@@ -192,7 +228,9 @@ class Pipeline:
             require_departure=True,
             hand_track_base_distance=config.hoi_hand_track_base_distance(),
             hand_track_iou_threshold=config.hoi_hand_track_iou_threshold(),
+            area_masks_by_frame=masks,
         )
+        LOG.info("货柜掩码轨迹筛选：%s", gate)
         moving, _ = inspect_video_motion(path, frames)
         all_tracks = build_visual_motion_tracks(moving)
         tracks = {}
@@ -206,15 +244,20 @@ class Pipeline:
                 tracks[track_id] = (score, track)
 
         if not tracks:
-            status, _ = _classify_without_match(detection, path, self)
-            if status == "door_opened_no_taken" and gate["taken_tracks"] == 0:
-                return outcome(3)
-            return outcome(4, "未获得足够的商品离架或身份匹配证据")
+            status, area_frames, departure = _classify_without_match(detection, path, self, masks)
+            return unmatched_video_result(
+                status,
+                departure,
+                gate["taken_tracks"],
+                door_opened=area_frames >= config.hoi_door_min_area_frames(),
+            )
         if len(tracks) != gate["taken_tracks"]:
-            return outcome(4, "存在离架轨迹未能确认商品，需复核")
+            return outcome(4, "存在未形成有效识别轨迹的拿取，需复核")
 
         matching = prepare_catalog(catalog)
         quantities = Counter()
+        unmatched = False
+        outside_scope = False
         for _, track in tracks.values():
             mx, my = width * 0.01, height * 0.01
             track = dict(
@@ -237,11 +280,37 @@ class Pipeline:
                 saved_features=catalog,
                 matching_catalog=matching,
                 use_trt_bg0=True,
+                sku_scope=sku_ids.keys() if len(catalog) > len(sku_ids) else None,
             )
-            best = accept_ranking(ranking, valid)
-            if not best:
-                return outcome(4, "存在商品轨迹无法匹配本单范围，需复核")
-            quantities[sku_ids[best["sku"]]] += 1
+            rejection = ranking_rejection_reason(ranking, valid)
+            LOG.info(
+                "商品匹配评分：轨迹=%s 有效帧=%s 前两名=%s 拒识原因=%s",
+                track["last_candidate"]["area_track_id"],
+                valid,
+                [
+                    {key: item[key] for key in ("sku", "vector", "color", "combined")}
+                    for item in ranking[:2]
+                ],
+                rejection,
+            )
+            if rejection == "ambiguous_margin":
+                return outcome(
+                    4, f"前两名商品综合分差小于 {config.SCORE_MIN_MARGIN:g}，无法确认商品"
+                )
+            if rejection == "insufficient_evidence":
+                return outcome(4, "商品轨迹的有效评分帧或匹配证据不足")
+            if rejection == "unmatched_scores":
+                unmatched = True
+                continue
+            best = ranking[0]
+            if best["sku"] in sku_ids:
+                quantities[sku_ids[best["sku"]]] += 1
+            else:
+                outside_scope = True
+        if unmatched:
+            return outcome(7, "已确认拿取，存在未能匹配本单范围内 SKU 的商品")
+        if outside_scope:
+            return outcome(7, "已确认拿取，商品可靠匹配到本单范围外的 SKU")
         items = [
             {"ks_sku_id": sku_id, "sku_num": count} for sku_id, count in sorted(quantities.items())
         ]

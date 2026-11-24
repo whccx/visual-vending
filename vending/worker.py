@@ -99,7 +99,7 @@ class Worker:
         )
 
     def recognize(self, job) -> None:
-        body, features = self.store.recognition_data(job["ref"])
+        body, features, comparisons = self.store.recognition_data(job["ref"])
         try:
             spool = self.config.data_dir / "spool"
             spool.mkdir(exist_ok=True)
@@ -109,7 +109,9 @@ class Worker:
                 videos = video_files(body, shared, self.config)
                 for path in videos:
                     path.chmod(0o640)
-                result = self.pipeline.recognize(videos, body["container_id"], features)
+                result = self.pipeline.recognize(
+                    videos, body["container_id"], features, comparison_assets=comparisons
+                )
         except MediaError as error:
             result = outcome(10, str(error)[:256])
         except Exception:

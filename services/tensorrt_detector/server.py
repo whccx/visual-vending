@@ -46,6 +46,8 @@ app = FastAPI(title="独立 TensorRT 商品检测服务", lifespan=lifespan)
 
 class DetectRequest(BaseModel):
     video_path: str
+    area_missing_max_frames: int = Field(default=375, ge=0, le=10000, strict=True)
+    areas: list[list[int] | None]
 
 
 class SegmentPoint(BaseModel):
@@ -80,7 +82,7 @@ def detect(request: DetectRequest):
     path = video_path(request.video_path)
     try:
         with LOCK:
-            return detector.detect(path)
+            return detector.detect(path, request.area_missing_max_frames, request.areas)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
