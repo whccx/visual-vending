@@ -29,6 +29,7 @@ x-runtime: &runtime
 
 services:
   api:
+    container_name: visual-vending-api
     <<: *runtime
     environment:
       <<: *runtime-env
@@ -43,18 +44,8 @@ services:
       timeout: 3s
       retries: 10
 
-  api-http:
-    <<: *runtime
-    command: ["-m", "uvicorn", "vending.api:app", "--host", "0.0.0.0", "--port", "8768"]
-    ports:
-      - "${VENDING_HTTP_BIND:-127.0.0.1}:${VENDING_HTTP_PORT:-18769}:8768"
-    healthcheck:
-      test: ["CMD", "/opt/conda/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8768/health',timeout=2)"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   worker:
+    container_name: visual-vending-worker
     <<: *runtime
     command: ["-m", "vending.worker"]
     extra_hosts:
@@ -81,6 +72,7 @@ services:
               count: 1
 
   detector:
+    container_name: visual-vending-detector
     image: ${VENDING_TENSORRT_IMAGE:-visual-vending-tensorrt:local}
     pull_policy: never
     restart: unless-stopped

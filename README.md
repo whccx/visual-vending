@@ -51,7 +51,7 @@ docker compose ps
 curl --cacert data/tls.crt https://localhost:18768/health
 ```
 
-交互文档默认在 `https://localhost:18768/docs`。如需无证书告警的 HTTP 入口，`compose.yaml` 内置 `api-http` 服务，默认监听 `127.0.0.1:18769`（`VENDING_HTTP_PORT` 可改）；在 `.env` 设 `VENDING_HTTP_BIND=0.0.0.0` 可放通全部本机 IPv4 地址供局域网访问。同机 Java 使用 `vision.host=localhost:18768`，本地自签名证书需要加入其联调信任库。项目配置的本地信任库为 `data/visual-local-trust.p12`，密码为 `changeit`。Java 回调或媒体服务在宿主机运行时，worker 可用 `host.docker.internal` 访问宿主机绑定在可达接口的端口。端口只绑定回环地址，外部对接使用另行配置的受信任 HTTPS 入口。代理应保留验签所需的原始路径和 Host；如代理改写了 Host，通过 `VENDING_SIGNING_HOST` 指定客户端实际用于验签的值。Java 回调入口、商户端地址和源平台请求契约仍由现有 `visual-platform` 管理。
+交互文档默认在 `https://localhost:18768/docs`。同机 Java 使用 `vision.host=localhost:18768`，本地自签名证书需要加入其联调信任库。项目配置的本地信任库为 `data/visual-local-trust.p12`，密码为 `changeit`。Java 回调或媒体服务在宿主机运行时，worker 可用 `host.docker.internal` 访问宿主机绑定在可达接口的端口。端口只绑定回环地址，外部对接使用另行配置的受信任 HTTPS 入口。代理应保留验签所需的原始路径和 Host；如代理改写了 Host，通过 `VENDING_SIGNING_HOST` 指定客户端实际用于验签的值。Java 回调入口、商户端地址和源平台请求契约仍由现有 `visual-platform` 管理。
 
 | 环境变量 | 作用 |
 |---|---|
@@ -62,7 +62,6 @@ curl --cacert data/tls.crt https://localhost:18768/health
 | `VENDING_CHECK_IMAGE_SIZE` | 默认检查参考图尺寸及比例。设为 0 可用非标准参考图做本机验收。 |
 | `VENDING_REVIEW_DETECTOR` | 默认 `onnx`，使用本容器的 YOLO-World。可显式选择 `yoloe`，或用 `auto` 优先选择可用的 YOLO-World。 |
 | `VENDING_PORT`、`VENDING_BIND` | 监听端口及绑定地址；默认只绑回环地址，设 `VENDING_BIND=0.0.0.0` 可放通局域网（配合证书 SAN）。 |
-| `VENDING_HTTP_BIND`、`VENDING_HTTP_PORT` | 本机 HTTP 入口（api-http 服务，无 TLS）的绑定地址与端口。 |
 | `VENDING_GPU_IMAGE`、`VENDING_TENSORRT_IMAGE` | 运行镜像。 |
 
 `resource_type=1` 接收 URL 列表或 `resource_infos` 中的 URL。 `resource_type=2` 在 `data/resources` 中查找与 `resource_id` 同名的预登记文件。API 内可保留货架层和相机 ID 元数据。库表、测试数据和回调队列均在本项目 `data` 目录。
