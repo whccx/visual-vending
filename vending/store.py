@@ -185,7 +185,12 @@ class Store:
         row = db.execute(
             """
             SELECT sku.*, latest.state, latest.comments, latest.image_rejected,
-                   latest.body AS latest_body, active.body AS active_body, active.image_hashes AS active_hashes
+                   latest.body AS latest_body, active.body AS active_body,
+                   active.image_hashes AS active_hashes,
+                   EXISTS (
+                       SELECT 1 FROM sku_image_hold AS held
+                       WHERE held.version=latest.id AND held.decision='waiting'
+                   ) AS waiting_for_image_review
             FROM sku
             JOIN sku_version AS latest ON sku.latest_version=latest.id
             LEFT JOIN sku_version AS active ON sku.active_version=active.id
@@ -228,7 +233,8 @@ class Store:
     def audit(self, owner: str, sku_id: str) -> dict:
         with self.connection() as db:
             row = self._sku(db, owner, sku_id)
-        payload = {"result": {"code": row["state"], "desc": AUDIT[row["state"]]}}
+        state = 0 if row["waiting_for_image_review"] else row["state"]
+        payload = {"result": {"code": state, "desc": AUDIT[state]}}
         if row["comments"]:
             payload["comments"] = row["comments"]
         return payload

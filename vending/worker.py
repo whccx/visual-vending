@@ -15,7 +15,7 @@ import requests
 
 from vending.config import Settings
 from vending.engine import ImageRejected, Pipeline, image_hashes
-from vending.image_review import ImageReviewRequired, LocalProductDetector, check_reference_images
+from vending.image_review import ImageReviewRequired, check_reference_images, make_product_detector
 from vending.media import MediaError, http_session, images_from_urls, save_cover, video_files
 from vending.protocol import ApiError, allowed_url, authorization
 from vending.store import Store, outcome
@@ -31,7 +31,9 @@ class Worker:
         self.config = config
         self.store = store
         self.pipeline = pipeline
-        self.image_detector = LocalProductDetector() if image_detector is None else image_detector
+        self.image_detector = (
+            make_product_detector(config) if image_detector is None else image_detector
+        )
 
     def process_job(self) -> bool:
         job = self.store.claim_job()

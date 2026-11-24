@@ -1,15 +1,35 @@
 """商品主体与画质审核，使用本项目的本地模型执行检测。"""
 
 import io
+import json
 import logging
+import os
+import select
+import subprocess
+import tempfile
 from collections.abc import Callable
 from functools import cached_property
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from vending.config import Settings
+
 LOG = logging.getLogger("vending.image_review")
+
+ROOT = Path(__file__).resolve().parent.parent
+ONNX_DIR = ROOT / "models/review"
+ONNX_SCRIPT = Path(__file__).resolve().with_name("onnx_detect.py")
+ONNX_MODELS = (
+    ONNX_DIR
+    / "yolo_world_v2_xl_vlpan_bn_2e-3_100e_4x8gpus_obj365v1_goldg_train_lvis_minival.onnx",
+    ONNX_DIR / "textual.onnx",
+    ONNX_DIR / "non_maximum_suppression.onnx",
+)
+DEFAULT_ONNX_PYTHON = "/opt/comfy-conda/bin/python"
+DEFAULT_ONNX_LIBS = "/opt/comfy-conda/lib/python3.11/site-packages/nvidia/cu13/lib"
 
 PRODUCT_CLASSES = [
     "Can",
@@ -198,6 +218,129 @@ class LocalProductDetector:
                 strict=True,
             )
         ]
+
+
+class OnnxProductDetector:
+    """通过本项目镜像内的 ONNX 运行时（comfy 环境）执行 YOLO-World 检测。
+
+    worker 主进程没有 onnxruntime，此处按需拉起镜像内自带 onnxruntime-gpu 的
+    Python 子进程，常驻复用已加载的三个 ONNX 会话。
+    """
+
+    def __init__(
+        self,
+        *,
+        python: str = DEFAULT_ONNX_PYTHON,
+        script: Path = ONNX_SCRIPT,
+        classes: list[str] | None = None,
+        timeout: float = 300.0,
+    ) -> None:
+        self.python = python
+        self.script = Path(script)
+        self.classes = list(classes or CLASSES)
+        self.timeout = timeout
+        self.process = None
+        self._tokens = None
+
+    @staticmethod
+    def ready(python: str) -> bool:
+        """运行时、脚本、模型和词表编码依赖齐备时才可用。"""
+        if not Path(python).exists() or not ONNX_SCRIPT.exists():
+            return False
+        if not all(path.exists() for path in ONNX_MODELS):
+            return False
+        try:
+            from clip.simple_tokenizer import SimpleTokenizer  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def tokens(self) -> list[list[int]]:
+        """用本项目运行库中的 CLIP 词表把类别名编成 textual 模型输入。"""
+        if self._tokens is None:
+            from clip.simple_tokenizer import SimpleTokenizer
+
+            self._tokens = SimpleTokenizer()(self.classes, context_length=77).tolist()
+        return self._tokens
+
+    def _ensure_process(self) -> subprocess.Popen:
+        if self.process is not None and self.process.poll() is None:
+            return self.process
+        if not self.ready(self.python):
+            raise RuntimeError("YOLO-World 缺少本容器的运行时、模型或词表依赖")
+        environment = dict(os.environ)
+        libs = os.environ.get("VENDING_REVIEW_ONNX_LIBS", DEFAULT_ONNX_LIBS)
+        if Path(libs).is_dir():
+            environment["LD_LIBRARY_PATH"] = (
+                libs + ":" + environment.get("LD_LIBRARY_PATH", "")
+            )
+        self.process = subprocess.Popen(
+            [self.python, str(self.script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=environment,
+            cwd=str(ROOT),
+        )
+        return self.process
+
+    def _read_line(self) -> str:
+        descriptor = self.process.stdout.fileno()
+        ready, _, _ = select.select([descriptor], [], [], self.timeout)
+        if not ready:
+            raise TimeoutError("商品检测子进程超时")
+        line = self.process.stdout.readline()
+        if not line:
+            raise RuntimeError("商品检测子进程已退出")
+        return line
+
+    def __call__(self, image: Image.Image) -> list[dict]:
+        """把图片交给常驻子进程检测，返回类别、分数和原图坐标检测框。"""
+        process = self._ensure_process()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False, dir="/tmp") as handle:
+            path = handle.name
+        try:
+            image.save(path, "PNG")
+            request = json.dumps(
+                {
+                    "classes": self.classes,
+                    "tokens": self.tokens(),
+                    "images": [path],
+                    "score_threshold": POLICY["detect_score"],
+                    "iou_threshold": 0.5,
+                },
+                ensure_ascii=False,
+            )
+            process.stdin.write(request + "\n")
+            process.stdin.flush()
+            reply = json.loads(self._read_line())
+            if "error" in reply:
+                raise RuntimeError(f"商品检测失败：{reply['error']}")
+            return reply["results"][0]
+        except (BrokenPipeError, OSError) as exc:
+            self._restart()
+            raise RuntimeError(f"商品检测子进程不可用：{exc}") from exc
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def _restart(self) -> None:
+        if self.process is not None:
+            self.process.kill()
+            self.process.wait()
+            self.process = None
+
+
+def make_product_detector(config: Settings) -> Callable[[Image.Image], list[dict]]:
+    """按配置选择审核检测器：容器内 ONNX YOLO-World 或本地 YOLOE。"""
+    choice = config.review_detector
+    python = config.review_onnx_python
+    if choice == "onnx" or (choice == "auto" and OnnxProductDetector.ready(python)):
+        LOG.info("商品审核检测器：容器内 YOLO-World ONNX")
+        return OnnxProductDetector(python=python)
+    if choice not in ("auto", "yoloe"):
+        raise ValueError(f"未知的商品审核检测器配置：{choice}")
+    LOG.info("商品审核检测器：本地 YOLOE")
+    return LocalProductDetector()
 
 
 def review_image(content: bytes, detector: Callable[[Image.Image], list[dict]]) -> dict:

@@ -11,6 +11,7 @@ x-runtime: &runtime
     - ./data:/workspace/data
     - ${VENDING_MODEL_DIR:-./models}:/workspace/models:ro
     - ${VENDING_RUNTIME_DIR:-./runtime}:/workspace/runtime:ro
+    - /usr/share/zoneinfo/Asia/Shanghai:/usr/share/zoneinfo/Asia/Shanghai:ro
   environment: &runtime-env
     PYTHONDONTWRITEBYTECODE: "1"
     PYTHONPATH: /workspace
@@ -21,12 +22,17 @@ x-runtime: &runtime
     VENDING_CALLBACK_HOSTS: ${VENDING_CALLBACK_HOSTS:-}
     VENDING_CALLBACK_DELAY: ${VENDING_CALLBACK_DELAY:-3}
     VENDING_CHECK_IMAGE_SIZE: ${VENDING_CHECK_IMAGE_SIZE:-1}
+    VENDING_REVIEW_DETECTOR: ${VENDING_REVIEW_DETECTOR:-onnx}
+    VENDING_REVIEW_ONNX_PYTHON: ${VENDING_REVIEW_ONNX_PYTHON:-/opt/comfy-conda/bin/python}
     VENDING_PUBLIC_URL: ${VENDING_PUBLIC_URL:-}
     SKU_LOG_DIR: /workspace/data/logs
 
 services:
   api:
     <<: *runtime
+    environment:
+      <<: *runtime-env
+      TZ: Asia/Shanghai
     command: ["-m", "uvicorn", "vending.api:app", "--host", "0.0.0.0", "--port", "8768",
               "--ssl-certfile", "/workspace/data/tls.crt", "--ssl-keyfile", "/workspace/data/tls.key"]
     ports:
@@ -57,6 +63,7 @@ services:
       disable: true
     environment:
       <<: *runtime-env
+      TZ: Asia/Shanghai
       SKU_HOI_TENSORRT_URL: http://detector:8770
       NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics,display
       EGL_PLATFORM: surfaceless
@@ -82,6 +89,7 @@ services:
       - "1000"
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
+      TZ: Asia/Shanghai
     volumes:
       - ./services/tensorrt_detector:/service:ro
       - ./data/spool:/workspace/data/spool:ro

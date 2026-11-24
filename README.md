@@ -60,6 +60,7 @@ curl --cacert data/tls.crt https://localhost:18768/health
 | `VENDING_CALLBACK_DELAY` | 终态首次投递前的等待时间，默认 3 秒。实际切换要按 Java 事务落库窗口核实。 |
 | `VENDING_PUBLIC_URL` | 用于生成可访问的 300×300 商品封面地址。未配置时使用第一张参考图地址。 |
 | `VENDING_CHECK_IMAGE_SIZE` | 默认检查参考图尺寸及比例。设为 0 可用非标准参考图做本机验收。 |
+| `VENDING_REVIEW_DETECTOR` | 默认 `onnx`，使用本容器的 YOLO-World。可显式选择 `yoloe`，或用 `auto` 优先选择可用的 YOLO-World。 |
 | `VENDING_PORT`、`VENDING_BIND` | 监听端口及绑定地址；默认只绑回环地址，设 `VENDING_BIND=0.0.0.0` 可放通局域网（配合证书 SAN）。 |
 | `VENDING_HTTP_BIND`、`VENDING_HTTP_PORT` | 本机 HTTP 入口（api-http 服务，无 TLS）的绑定地址与端口。 |
 | `VENDING_GPU_IMAGE`、`VENDING_TENSORRT_IMAGE` | 运行镜像。 |
@@ -68,13 +69,13 @@ curl --cacert data/tls.crt https://localhost:18768/health
 
 ## 商品图片审核
 
-新建 SKU 或首次提交更换后的参考图时，GPU worker 下载图片后先用本地 YOLOE 找商品主体，再用 OpenCV 检查居中、面积、清晰度和多主体歧义。审核规则取自商品图片审核项目，模型及文本编码器直接从 `models/held_product` 加载。审核流程在本容器完成，部署时只需本项目。
+新建 SKU 或提交允许更换的参考图时，GPU worker 下载图片后使用容器内的 YOLO-World ONNX 检测商品主体，再用 OpenCV 检查居中、面积、清晰度和多主体歧义。透明图片先合成白底再检测。审核使用本项目的 `models/review` 模型和镜像内的 ONNX Runtime。
 
 | 图片结果 | SKU 处理 |
 |---|---|
 | 全部通过 | 继续提取向量，建模成功后发审核通过回调。 |
 | 有图片明确拒绝 | 终止建模，在审核结果与回调中附上第几张图及拒绝原因。 |
-| 有图片需人工，或本地检测异常 | SKU 保持审核中，等待人工决定或重试。 |
+| 有图片需人工，或本地检测异常 | SKU 进入人工复核队列，查询返回 `0 / 待审核`，等待人工决定或重试。 |
 
 本地复核用下列命令。人工通过只适用于复核时的同一批图片内容，通过后仍需正常建模。人工拒绝按原协议发送审核不通过回调。
 

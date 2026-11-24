@@ -51,6 +51,19 @@ def test_blurred_item_and_invalid_file():
     detector.assert_not_called()
 
 
+def test_transparent_cutout_requires_product_detection():
+    cutout = Image.new("RGBA", (400, 400))
+    cutout.paste((20, 60, 90, 255), (80, 40, 320, 360))
+    buffer = io.BytesIO()
+    cutout.save(buffer, format="PNG")
+    detector = Mock(return_value=[])
+
+    assert review_image(buffer.getvalue(), detector)["reason_code"] == "no_product"
+    processed = detector.call_args.args[0]
+    assert processed.mode == "RGB"
+    assert processed.getpixel((0, 0)) == (255, 255, 255)
+
+
 @pytest.fixture
 def audit(tmp_path, monkeypatch):
     store = Store(tmp_path)
@@ -100,7 +113,7 @@ def test_manual_hold_survives_restart_and_can_be_approved(audit):
     assert worker.process_job()
     pipeline.build.assert_not_called()
     store.requeue_jobs()
-    assert store.audit("shop", ident)["result"]["code"] == 1
+    assert store.audit("shop", ident)["result"] == {"code": 0, "desc": "待审核"}
     assert store.pending_image_reviews()[0]["findings"][0]["reason_code"] == "weak_detection"
     assert store.claim_delivery() is None
     assert not worker.process_job()
@@ -121,7 +134,7 @@ def test_manual_approval_applies_only_to_the_checked_images(audit):
     assert worker.process_job()
     assert detector.call_count == 2
     pipeline.build.assert_not_called()
-    assert store.audit("shop", ident)["result"]["code"] == 1
+    assert store.audit("shop", ident)["result"]["code"] == 0
     assert store.claim_delivery() is None
     store.decide_image_review(ident, "reject", "商品放错")
     assert worker.process_job()
@@ -136,5 +149,5 @@ def test_detection_error_goes_to_review_instead_of_modeling(audit):
     detector.side_effect = OSError("detector unavailable")
     assert worker.process_job()
     pipeline.build.assert_not_called()
-    assert store.audit("shop", ident)["result"]["code"] == 1
+    assert store.audit("shop", ident)["result"]["code"] == 0
     assert store.pending_image_reviews()[0]["findings"][0]["reason_code"] == "detector_error"

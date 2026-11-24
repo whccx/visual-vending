@@ -27,6 +27,8 @@ class Settings:
     signature_age: int = 300
     max_pending: int = 100
     check_image_size: bool = True
+    review_detector: str = "onnx"
+    review_onnx_python: str = "/opt/comfy-conda/bin/python"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -49,6 +51,10 @@ class Settings:
             callback_delay=float(os.environ.get("VENDING_CALLBACK_DELAY", "3")),
             max_pending=int(os.environ.get("VENDING_MAX_PENDING", "100")),
             check_image_size=os.environ.get("VENDING_CHECK_IMAGE_SIZE", "1") == "1",
+            review_detector=os.environ.get("VENDING_REVIEW_DETECTOR", "onnx").strip().lower(),
+            review_onnx_python=os.environ.get(
+                "VENDING_REVIEW_ONNX_PYTHON", "/opt/comfy-conda/bin/python"
+            ),
         )
 
 
