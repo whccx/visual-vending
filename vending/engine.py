@@ -24,19 +24,32 @@ def image_hashes(images: list[bytes]) -> list[str]:
     return [hashlib.sha256(image).hexdigest() for image in images]
 
 
-def pack_features(features, colors, full_colors) -> bytes:
+def pack_features(features, colors, full_colors, *, embedding_model: str | None = None) -> bytes:
     import numpy as np
 
     stream = BytesIO()
-    np.savez_compressed(stream, features=features, colors=colors, full_colors=full_colors)
+    arrays = dict(features=features, colors=colors, full_colors=full_colors)
+    if embedding_model is not None:
+        arrays["embedding_model"] = embedding_model
+    np.savez_compressed(stream, **arrays)
     return stream.getvalue()
 
 
-def unpack_features(data: bytes) -> dict:
+def unpack_features(data: bytes, *, arcface: bool = False) -> dict:
     import numpy as np
 
     with np.load(BytesIO(data), allow_pickle=False) as arrays:
-        return {key: arrays[key] for key in ("features", "colors", "full_colors")}
+        features = arrays["features"]
+        if arcface:
+            from app.config import ARCFACE_DIMS, ARCFACE_MODEL_ID
+
+            if "embedding_model" not in arrays or arrays["embedding_model"].item() != ARCFACE_MODEL_ID:
+                raise ValueError("商品缺少当前 ViT-7B ArcFace 向量")
+            if features.ndim != 2 or features.shape[1] != ARCFACE_DIMS or not len(features):
+                raise ValueError("商品 ViT-7B ArcFace 向量形状无效")
+        elif "embedding_model" in arrays:
+            raise ValueError("当前商品向量与旧版 ViT-L 模型不兼容")
+        return {"features": features, "colors": arrays["colors"], "full_colors": arrays["full_colors"]}
 
 
 def unmatched_video_result(
@@ -117,6 +130,9 @@ def probe_video(path: Path) -> tuple[int, int, int, float]:
 class Pipeline:
     """以单进程 GPU worker 复用模型状态。"""
 
+    def __init__(self, *, arcface=None) -> None:
+        self.arcface = arcface
+
     @property
     def dino(self):
         if not hasattr(self, "_dino"):
@@ -124,9 +140,9 @@ class Pipeline:
 
             from app import config
 
-            self._dino = (
-                AutoModel.from_pretrained(str(config.MODEL), local_files_only=True).eval().cuda()
-            )
+            self._dino = AutoModel.from_pretrained(str(config.MODEL), local_files_only=True).eval()
+            if self.arcface is None:
+                self._dino.cuda()
         return self._dino
 
     @cached_property
@@ -149,10 +165,10 @@ class Pipeline:
         from app.catalog.product_catalog import decode, features_for_images
         from app.recognition.full_color import from_bgra
 
-        full_colors = []
+        full_colors, hues = [], []
         for image in images:
             try:
-                pixels = decode(image)[0]
+                pixels, _, hue = decode(image)
             except ValueError as exc:
                 raise ImageRejected("参考图片无法解码") from exc
             height, width = pixels.shape[:2]
@@ -162,6 +178,14 @@ class Pipeline:
             ):
                 raise ImageRejected("图片尺寸或长宽比不符合规范")
             full_colors.append(from_bgra(pixels))
+            hues.append(hue)
+        if self.arcface is not None:
+            from app.config import ARCFACE_MODEL_ID
+
+            return pack_features(
+                self.arcface.references(images), np.asarray(hues, dtype=np.float64),
+                np.asarray(full_colors, dtype=np.float32), embedding_model=ARCFACE_MODEL_ID,
+            )
         features, colors = features_for_images(images, model=self.dino)
         return pack_features(features, colors, np.asarray(full_colors, dtype=np.float32))
 

@@ -2,6 +2,7 @@
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
 
@@ -73,6 +74,7 @@ def test_authenticated_routes_and_error_envelope(context):
     client, _, _ = context
     assert client.post(PREFIX + "/sku", json={}).json() == {"msg": "MISSING_ARGUMENTS: access_key"}
     assert signed(client, "POST", PREFIX + "/sku", {}, secret="wrong").status_code == 401
+
     missing = signed(client, "POST", PREFIX + "/sku", {})
     assert missing.status_code == 400 and missing.json()["msg"].startswith("MISSING_ARGUMENTS")
     unknown = signed(client, "GET", PREFIX + "/nope")
@@ -137,6 +139,50 @@ def test_sku_lifecycle_and_outbox(context, monkeypatch):
     assert state["attempts"] == 1 and state["next_at"] > time.time() + 9
     assert signed(client, "DELETE", audit_path).json()["data"]["sku_id"] == "vision-mock"
     assert signed(client, "GET", detail_path).status_code == 400
+
+
+def test_training_submission_status_and_artifact(context, monkeypatch):
+    _, db, config = context
+    config = replace(config, matching_model="dinov3_vit7b_arcface")
+    for sku in ("a", "b"):
+        db.import_sku(
+            owner="demo", caller_id=sku, sku_id=sku, info={"sku_name": sku}, features=b"test"
+        )
+    body = {
+        "positive_samples": [
+            {"sku_id": "a", "image_urls": ["https://assets.example/a.png"]},
+            {"sku_id": "b", "image_urls": ["https://assets.example/b.png"]},
+        ],
+        "negative_image_urls": ["https://assets.example/negative.png"],
+    }
+    with TestClient(create_app(config), base_url="https://svc.example") as client:
+        url = PREFIX + "/training"
+        assert signed(client, "POST", url, body, secret="bad").status_code == 401
+        assert signed(client, "POST", url, {
+            **body, "positive_samples": body["positive_samples"][:1]
+        }).status_code == 400
+        submitted = signed(client, "POST", url, body)
+        assert submitted.status_code == 200
+        identifier = submitted.json()["data"]["ks_training_id"]
+        assert signed(client, "POST", url, body).json()["data"]["ks_training_id"] == identifier
+        url += f"/{identifier}"
+        assert signed(client, "GET", url).json()["data"]["state"] == "queued"
+        assert signed(client, "GET", url, account="other", secret="other").status_code == 400
+        assert signed(client, "GET", url + "/artifact").status_code == 404
+        assert db.claim_job() is None
+        job = db.claim_job(training=True)
+        assert job["ref"] == identifier
+        assert signed(client, "GET", url).json()["data"]["state"] == "running"
+        directory = config.data_dir / "training" / identifier
+        directory.mkdir(parents=True)
+        (directory / "arcface_patch.safetensors").write_bytes(b"candidate")
+        monkeypatch.setattr("vending.worker.run_training", lambda *_: {
+            "state": "succeeded", "artifact": {"sha256": "test", "size": 9}
+        })
+        Worker(config, db, Mock()).train(job)
+        result = signed(client, "GET", url).json()["data"]
+        assert result["state"] == "succeeded"
+        assert signed(client, "GET", url + "/artifact").content == b"candidate"
 
 
 def test_legacy_sku_recognition_scope_and_signed_callback(context, monkeypatch):
@@ -327,7 +373,11 @@ def test_unmatched_video_status_mapping(status, departure, taken_tracks, door_op
 def test_documented_operations_and_callback_schema(context):
     client, _, _ = context
     document = client.get("/openapi.json").json()
-    assert sum(len(methods) for methods in document["paths"].values()) == 9
+    legacy = {path: methods for path, methods in document["paths"].items() if "/training" not in path}
+    assert sum(len(methods) for methods in legacy.values()) == 9
+    assert set(document["paths"][PREFIX + "/training"]) == {"post"}
+    assert set(document["paths"][PREFIX + "/training/{ks_training_id}"]) == {"get"}
+    assert set(document["paths"][PREFIX + "/training/{ks_training_id}/artifact"]) == {"get"}
     assert set(document["webhooks"]) == {"skuAuditResult", "recognitionResult"}
     create = document["paths"][PREFIX + "/sku"]["post"]
     assert "$ref" in create["responses"]["200"]["content"]["application/json"]["schema"]

@@ -32,6 +32,9 @@ from vending.schemas import (
     SkuEdit,
     SubmittedRecognition,
     SubmittedSku,
+    SubmittedTraining,
+    TrainingCreate,
+    TrainingStatus,
 )
 from vending.store import Store
 
@@ -229,6 +232,41 @@ def get_recognition(
     db: Database,
 ):
     return envelope(request, data=db.recognition(owner, ks_recog_id))
+
+
+@router.post("/training", response_model=Envelope[SubmittedTraining])
+def submit_training(request: Request, payload: TrainingCreate, owner: Owner, db: Database, config: Configuration):
+    from app.config import ARCFACE_MODEL_ID
+
+    if config.matching_model != ARCFACE_MODEL_ID:
+        raise ApiError(403, "TRAINING_MODEL_NOT_AVAILABLE")
+    for group in payload.positive_samples:
+        for url in group.image_urls:
+            allowed_url(url, config.asset_hosts, "positive_samples.image_urls")
+    for url in payload.negative_image_urls:
+        allowed_url(url, config.asset_hosts, "negative_image_urls")
+    identifier = db.submit_training(owner, payload.model_dump(), config.max_pending)
+    return envelope(request, data={"ks_training_id": identifier})
+
+
+@router.get(
+    "/training/{ks_training_id}", response_model=Envelope[TrainingStatus],
+    response_model_exclude_unset=True,
+)
+def get_training(request: Request, ks_training_id: PathID, owner: Owner, db: Database):
+    return envelope(request, data=db.training(owner, ks_training_id))
+
+
+@router.get(
+    "/training/{ks_training_id}/artifact", response_class=FileResponse,
+    responses={200: {"content": {"application/octet-stream": {}}}},
+)
+def get_training_artifact(ks_training_id: PathID, owner: Owner, db: Database, config: Configuration):
+    result = db.training(owner, ks_training_id)
+    path = config.data_dir / "training" / result["ks_training_id"] / "arcface_patch.safetensors"
+    if result["state"] != "succeeded" or not path.is_file():
+        raise ApiError(404, "TRAINING_ARTIFACT_NOT_AVAILABLE")
+    return FileResponse(path, media_type="application/octet-stream", filename=f"{ks_training_id}.safetensors")
 
 
 class VerifyRequests:

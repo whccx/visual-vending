@@ -1,6 +1,7 @@
 """处理持久任务，后台独立发送两种签名回调。"""
 
 import fcntl
+import gc
 import json
 import logging
 import signal
@@ -20,6 +21,7 @@ from vending.image_review import ImageReviewRequired, check_reference_images, ma
 from vending.media import MediaError, http_session, images_from_urls, save_cover, video_files
 from vending.protocol import ApiError, allowed_url, authorization
 from vending.store import Store, outcome
+from vending.training_job import run_training
 
 LOG = logging.getLogger("vending.worker")
 ACK = {"code": "10000", "msg": "请求成功", "data": {}}
@@ -133,6 +135,17 @@ class Worker:
             result = outcome(4, "识别服务未能完成本单处理")
         self.store.finish_recognition(job, result, self.config.callback_delay)
 
+    def train(self, job) -> None:
+        identifier = job["ref"]
+        try:
+            result = run_training(self.config, identifier, self.store.training_body(identifier))
+        except MediaError as error:
+            result = {"state": "failed", "comments": str(error)[:256]}
+        except Exception:
+            LOG.exception("微调训练失败，编号 %s", identifier)
+            result = {"state": "failed", "comments": "微调训练未能完成，请核对样本或服务日志"}
+        self.store.finish_training(job, result)
+
     def deliver(self) -> bool:
         event = self.store.claim_delivery()
         if event is None:
@@ -191,10 +204,48 @@ def main() -> None:
         except BlockingIOError as exc:
             raise SystemExit("该数据目录已有 GPU worker") from exc
         store.requeue_jobs()
+        from app.config import ARCFACE_MODEL_ID
+        from vending.arcface import ArcFaceEncoder
         from vending.frame_pipeline import FrameRuntime
 
-        runtime = FrameRuntime(config.video_concurrency)
-        worker = Worker(config, store, Pipeline(), recognition_pipeline=runtime)
+        arcface = ArcFaceEncoder() if config.matching_model == ARCFACE_MODEL_ID else None
+        worker = Worker(
+            config, store, Pipeline(arcface=arcface),
+            recognition_pipeline=FrameRuntime(config.video_concurrency, arcface=arcface),
+        )
+        jobs_ready = threading.Condition()
+        active_jobs = 0
+        training_active = False
+
+        def normal_job() -> bool:
+            nonlocal active_jobs
+            with jobs_ready:
+                while training_active and not stop.is_set():
+                    jobs_ready.wait(0.25)
+                if stop.is_set():
+                    return False
+                active_jobs += 1
+            try:
+                return worker.process_job()
+            finally:
+                with jobs_ready:
+                    active_jobs -= 1
+                    jobs_ready.notify_all()
+
+        def training_job(job) -> None:
+            import torch
+
+            LOG.info("正在训练候选模型，识别任务继续排队，编号 %s", job["ref"])
+            try:
+                worker.recognition_pipeline.close()
+                worker.recognition_pipeline = None
+                if arcface is not None:
+                    arcface.release()
+                gc.collect()
+                torch.cuda.empty_cache()
+                worker.train(job)
+            finally:
+                worker.recognition_pipeline = FrameRuntime(config.video_concurrency, arcface=arcface)
 
         def poll(method):
             while not stop.is_set():
@@ -207,20 +258,44 @@ def main() -> None:
 
         callbacks = threading.Thread(target=poll, args=(worker.deliver,), name="callbacks")
         callbacks.start()
+        LOG.info("正式识别模型：%s", config.matching_model)
         LOG.info("视频识别并发上限：%s", config.video_concurrency)
         try:
             with ThreadPoolExecutor(
                 max_workers=config.video_concurrency, thread_name_prefix="订单"
             ) as jobs:
-                futures = [
-                    jobs.submit(poll, worker.process_job) for _ in range(config.video_concurrency)
-                ]
-                for future in futures:
-                    future.result()
+                for _ in range(config.video_concurrency):
+                    jobs.submit(poll, normal_job)
+                try:
+                    while not stop.is_set():
+                        try:
+                            if arcface is not None and store.pending_training():
+                                with jobs_ready:
+                                    training_active = True
+                                    jobs_ready.wait_for(lambda: active_jobs == 0)
+                                try:
+                                    job = store.claim_job(training=True) if not stop.is_set() else None
+                                    if job is not None:
+                                        try:
+                                            training_job(job)
+                                        except Exception:
+                                            store.retry_job(job)
+                                            raise
+                                finally:
+                                    with jobs_ready:
+                                        training_active = False
+                                        jobs_ready.notify_all()
+                        except Exception:
+                            LOG.exception("训练任务队列暂时不可用")
+                        stop.wait(0.25)
+                finally:
+                    stop.set()
+                    with jobs_ready:
+                        jobs_ready.notify_all()
         finally:
             stop.set()
             callbacks.join()
-            runtime.close()
+            worker.recognition_pipeline.close()
 
 
 if __name__ == "__main__":

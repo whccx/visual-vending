@@ -189,63 +189,46 @@ def image_variants(image):
         yield suffix + "_cw90", cv2.rotate(scaled, cv2.ROTATE_90_CLOCKWISE)
 
 
-def features_for_images(payloads, model=None):
-    """为上传图片及其缩放、旋转变体计算 DINO 向量和原图颜色特征。
+def reference_batches(payloads):
+    """产出每张参考图的八个归一化变体及原图色相。"""
+    import torch
 
-    参数：
-        payloads: 图片字节序列。
-        model: 可选的已加载模型；未指定时从本地加载并在结束后释放。
-    返回：
-        float32 特征矩阵与 float64 颜色直方图数组。
-    异常：
-        CUDA 不可用或图片无效时抛出异常。
-    """
+    mean = np.array([0.485, 0.456, 0.406], np.float32)
+    std = np.array([0.229, 0.224, 0.225], np.float32)
+    for data in payloads:
+        image, _, color = decode(data)
+        augmented = []
+        for _, variant in image_variants(image):
+            bgr = variant[:, :, :3]
+            if variant.shape[2] == 4:
+                alpha = variant[:, :, 3:4].astype(np.float32) / 255
+                bgr = (bgr.astype(np.float32) * alpha).astype(np.uint8)
+            resized = cv2.resize(bgr, (224, 224), interpolation=cv2.INTER_LINEAR)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
+            normalized = ((rgb - mean) / std).transpose(2, 0, 1)
+            augmented.append(torch.from_numpy(np.ascontiguousarray(normalized)))
+        yield torch.stack(augmented), color
+
+
+def features_for_images(payloads, model=None):
+    """用现有 DINO 骨干生成 float32 参考向量和颜色特征。"""
     import torch
     import torch.nn.functional as F
     from transformers import AutoModel
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA unavailable")
-
-    colors = []
-    for data in payloads:
-        _, _, color = decode(data)
-        colors.append(color)
-
     owned_model = model is None
     if owned_model:
+        if not torch.cuda.is_available():
+            raise RuntimeError("缺少商品建模所需的 CUDA")
         model = AutoModel.from_pretrained(str(MODEL), local_files_only=True).eval().cuda()
+    device = next(model.parameters()).device
     torch.set_num_threads(4)
-    features = []
-
+    features, colors = [], []
     with torch.inference_mode():
-        for data in payloads:
-            image, _, _ = decode(data)
-            aug = []
-            for _, variant in image_variants(image):
-                orig = variant[:, :, :3]
-                alpha = variant[:, :, 3] if variant.shape[2] == 4 else None
-                composite = (
-                    (orig.astype(np.float32) * (alpha[:, :, None].astype(np.float32) / 255)).astype(
-                        np.uint8
-                    )
-                    if alpha is not None
-                    else orig
-                )
-                z = cv2.resize(composite, (224, 224), interpolation=cv2.INTER_LINEAR)
-                z = cv2.cvtColor(z, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
-                z = (z - np.array([0.485, 0.456, 0.406], np.float32)) / np.array(
-                    [0.229, 0.224, 0.225], np.float32
-                )
-                aug.append(torch.from_numpy(np.ascontiguousarray(z.transpose(2, 0, 1))))
-
-            result = (
-                F.normalize(model(pixel_values=torch.stack(aug).cuda()).pooler_output, dim=1)
-                .cpu()
-                .numpy()
-            )
-            features.extend(result)
-
+        for augmented, color in reference_batches(payloads):
+            output = model(pixel_values=augmented.to(device)).pooler_output.float()
+            features.extend(F.normalize(output, dim=1).cpu().numpy())
+            colors.append(color)
     if owned_model:
         del model
         torch.cuda.empty_cache()

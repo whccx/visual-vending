@@ -61,6 +61,7 @@ curl --cacert data/tls.crt https://localhost:18768/health
 | `VENDING_ASSET_HOSTS`、`VENDING_CALLBACK_HOSTS` | 允许的媒体和回调主机。 |
 | `VENDING_CALLBACK_DELAY` | 终态首次投递前的等待时间，默认 3 秒。实际切换要按 Java 事务落库窗口核实。 |
 | `VENDING_VIDEO_CONCURRENCY` | 同时处理的视频数，默认 5，可设置 1 至 5。修改后需重新创建 worker 容器。 |
+| `VENDING_MATCHING_MODEL` | `dinov3_vit7b_arcface` 使用保守判定，读取 `models/held_product/dinov3_vit7b_arcface` 的 BF16 权重和同型号商品向量。切换前需完成向量重建。 |
 | `VENDING_PUBLIC_URL` | 用于生成可访问的 300×300 商品封面地址。未配置时使用第一张参考图地址。 |
 | `VENDING_CHECK_IMAGE_SIZE` | 默认检查参考图尺寸及比例。设为 0 可用非标准参考图做本机验收。 |
 | `VENDING_REVIEW_DETECTOR` | 默认 `onnx`，使用本容器的 YOLO-World。可显式选择 `yoloe`，或用 `auto` 优先选择可用的 YOLO-World。 |

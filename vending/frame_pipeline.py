@@ -106,16 +106,21 @@ def split_video(path: Path, directory: Path, publish) -> int:
 class FrameRuntime:
     """共享 CPU、GPU 和检测服务的有限并发池。"""
 
-    def __init__(self, video_concurrency=5):
+    def __init__(self, video_concurrency=5, *, arcface=None):
         cv2.setNumThreads(1)
+        self.arcface = arcface
         self.video_pool = ThreadPoolExecutor(
             max_workers=video_concurrency, thread_name_prefix="视频"
         )
-        self.area_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="柜区")
+        self.area_pool = ThreadPoolExecutor(
+            max_workers=1 if arcface else 3, thread_name_prefix="柜区"
+        )
         self.gate_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="筛帧")
         self.hoi_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="交互检测")
         self.bg0_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="商品抠图")
-        self.score_pool = ThreadPoolExecutor(max_workers=5, thread_name_prefix="商品比对")
+        self.score_pool = ThreadPoolExecutor(
+            max_workers=1 if arcface else 5, thread_name_prefix="商品比对"
+        )
         self.local = threading.local()
         self.model_lock = threading.Lock()
         self.fallback_lock = threading.Lock()
@@ -256,15 +261,11 @@ class FrameRuntime:
                     )
         return self.model
 
-    def score(self, image_path, metadata_path, output, catalog):
-        import torch
-
+    def masked_crop(self, image_path, metadata_path):
         from app.recognition.hoi_mask_matching import (
-            _enhance_crop,
             _reject_small_mask,
             _remove_hand_from_mask,
         )
-        from app.recognition.product_matching import score_crop
 
         metadata = json.loads(metadata_path.read_text())
         box = metadata["box"]
@@ -274,24 +275,34 @@ class FrameRuntime:
         mask = raw_mask > 0
         image = read_frame(image_path)
         x1, y1, x2, y2 = box
-        save_png(output.with_suffix(".png"), image[y1:y2, x1:x2])
+        crop = np.ascontiguousarray(image[y1:y2, x1:x2])
         item = {"frame": int(image_path.stem), "mask": mask, "bg0_fraction": float(mask.mean())}
         if config.HOI_REMOVE_HAND and item["bg0_fraction"] >= config.HOI_MASK_MATCH_MIN_FRACTION:
             if not hasattr(self.local, "score_state"):
                 self.local.score_state = SimpleNamespace()
             item["mask"], _, _ = _remove_hand_from_mask(image, box, mask, self.local.score_state)
         _reject_small_mask(item)
-        if item["mask"] is None:
+        return crop, item["mask"], box
+
+    def score(self, image_path, metadata_path, output, catalog):
+        import torch
+
+        from app.recognition.hoi_mask_matching import _enhance_crop
+        from app.recognition.product_matching import score_crop
+
+        crop, mask, box = self.masked_crop(image_path, metadata_path)
+        save_png(output.with_suffix(".png"), crop)
+        if mask is None:
             save_json(output, {"frame": int(image_path.stem), "box": box, "scores": None})
             return output
-        rgb = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         enhanced = _enhance_crop(rgb)
         mean = torch.tensor([0.485, 0.456, 0.406], device="cuda")[None, :, None, None]
         std = torch.tensor([0.229, 0.224, 0.225], device="cuda")[None, :, None, None]
         with torch.inference_mode():
             _, scores = score_crop(
                 torch.from_numpy(enhanced).cuda().permute(2, 0, 1),
-                torch.from_numpy(np.ascontiguousarray(item["mask"])).cuda(),
+                torch.from_numpy(np.ascontiguousarray(mask)).cuda(),
                 self.dino(),
                 catalog,
                 mean,
@@ -304,9 +315,41 @@ class FrameRuntime:
         save_json(output, {"frame": int(image_path.stem), "box": box, "scores": scores})
         return output
 
+    def conservative_track(self, directory, points, catalog):
+        from vending.arcface import confirm_window, geometric_windows, score_window
+
+        windows, boxes = geometric_windows(points)
+        cached = {}
+        for window in windows:
+            if any(frame in cached and cached[frame][1] is None for frame in window):
+                continue
+            jobs = {}
+            for frame in window:
+                if frame in cached:
+                    continue
+                image = directory / "frames" / f"{frame:06d}.jpg"
+                box = boxes[frame]
+                key = "-".join(map(str, box))
+                mask = directory / "bg0" / f"{frame:06d}-{key}.png"
+                jobs[frame] = (image, self.bg0_pool.submit(self.segment, image, box, mask))
+            try:
+                for frame, (image, job) in jobs.items():
+                    crop, mask, _ = self.masked_crop(image, job.result())
+                    cached[frame] = (crop, mask)
+            finally:
+                wait([future for _, future in jobs.values()])
+            if any(cached[frame][1] is None for frame in window):
+                continue
+            sku, evidence = confirm_window(*score_window(
+                [cached[frame] for frame in window], self.arcface, catalog
+            ))
+            return sku, window, evidence
+        return None, (), {}
+
     def recognize(self, videos, cabinet_id, assets, *, comparison_assets=None):
+        options = {"arcface": True} if self.arcface is not None else {}
         catalog = {
-            index: unpack_features(data)
+            index: unpack_features(data, **options)
             for index, data in enumerate(
                 [*assets.values(), *(comparison_assets or {}).values()], start=1
             )
@@ -494,6 +537,21 @@ class FrameRuntime:
             return outcome(4, "存在未形成有效识别轨迹的拿取，需复核")
         matching = prepare_catalog(catalog)
         counts = Counter()
+        if self.arcface is not None:
+            for track_id, (_, points) in sorted(tracks.items()):
+                sku, window, evidence = self.score_pool.submit(
+                    self.conservative_track, directory, points, matching
+                ).result()
+                LOG.info(
+                    "商品保守判定：轨迹=%s 帧=%s 结果=%s 证据=%s",
+                    track_id, window, "确认" if sku in sku_ids else "需复核", evidence,
+                )
+                if sku not in sku_ids:
+                    return outcome(4, "商品轨迹或本单商品身份的匹配证据不足")
+                counts[sku_ids[sku]] += 1
+            return outcome(
+                2, items=[{"ks_sku_id": sku, "sku_num": count} for sku, count in sorted(counts.items())]
+            )
         unmatched = outside_scope = False
         for _, points in tracks.values():
             futures = []

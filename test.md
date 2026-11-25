@@ -70,6 +70,24 @@ Java 业务接口使用商户 `APP_ID` 和 `APP_SECRET` 做 HTTP Basic 认证。
 2. 自动识别模式下，Java 先创建 `visual_recognition_record`，再签名调用 `18768` 的 `POST /openapi/sc/v1/recognition`，并把返回的 `data.ksRecogId` 关联到平台记录。
 3. 在 [识别记录页面](http://localhost:18070/records) 按单号查看记录。识别服务回调 Java 的 `POST /openInterface/open/recognition/notifyRecog` 后，Java 按 `ksRecogId` 更新已有记录。满足转发条件时，Java 再向商户的 `callbackUrl` 发送结果。
 
+## ArcFace 微调
+
+在启用 ViT-7B ArcFace 的识别服务上，签名提交 `POST /openapi/sc/v1/training`。正样本按已审核 SKU 分组，至少提供两个不同 SKU，每个 SKU 至少一张图片。负样本只提供库外商品图片地址。图片支持 JPEG、PNG 和 WebP，地址使用已允许的媒体服务。已有商品裁剪图可直接作为样本。
+
+```json
+{
+  "positive_samples": [
+    {"sku_id": "862337050531238-6", "image_urls": ["http://host.docker.internal:8089/samples/6.png"]},
+    {"sku_id": "862337050531238-24", "image_urls": ["http://host.docker.internal:8089/samples/24.png"]}
+  ],
+  "negative_image_urls": ["http://host.docker.internal:8089/samples/unknown.png"]
+}
+```
+
+用返回的 `data.ks_training_id` 签名查询 `GET /openapi/sc/v1/training/{ks_training_id}`。状态为 `queued`、`running`、`succeeded` 或 `failed`。训练成功后，签名访问 `GET /openapi/sc/v1/training/{ks_training_id}/artifact` 下载末两层和输出 LayerNorm 的候选权重。查询结果提供 SHA-256 和文件大小。候选权重需要独立验收后才能用来更新识别模型和商品向量。
+
+训练和本机识别共用 GPU。已有推理结束后开始训练，期间接收的识别任务继续排队，训练结束后继续处理。正式模型本次使用的样本、来源和训练清单位于 `models/data/arcface-v1`。
+
 ## 识别直接测试
 
 1. 签名调用 `POST https://127.0.0.1:18768/openapi/sc/v1/recognition`。视频地址使用 `resource_type: 1`。将 `origin_time` 替换为本次提交的 13 位毫秒时间戳，并将 `extra_params.sku_scope` 中的 ID 替换为当前签名账户可用于识别的 SKU。需要验证回调时可加入 `notify_url`。

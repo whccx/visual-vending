@@ -65,7 +65,7 @@ def import_entry(
         info.pop("sub_sku")
     provided = [path if path.is_absolute() else manifest_dir / path for path in entry.image_files]
     features, images = None, []
-    if entry.legacy_cabinet is not None or entry.legacy_product is not None:
+    if pipeline.arcface is None and (entry.legacy_cabinet is not None or entry.legacy_product is not None):
         if not legacy_database or entry.legacy_cabinet is None or entry.legacy_product is None:
             raise ValueError("复用旧向量需要提供旧库路径、柜号及商品数字 ID")
         features = old_features(legacy_database, entry.legacy_cabinet, entry.legacy_product)
@@ -104,7 +104,11 @@ def main() -> None:
     store.initialize()
     records = json.loads(args.manifest.read_text())
     entries = [SkuImport.model_validate(record) for record in records]
-    pipeline = Pipeline()
+    from app.config import ARCFACE_MODEL_ID
+    from vending.arcface import ArcFaceEncoder
+
+    encoder = ArcFaceEncoder() if config.matching_model == ARCFACE_MODEL_ID else None
+    pipeline = Pipeline(arcface=encoder)
     for entry in entries:
         import_entry(store, entry, config, pipeline, args.manifest.resolve().parent, args.legacy_db)
         print(f"已导入 {entry.ks_sku_id}")

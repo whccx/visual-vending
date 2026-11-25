@@ -6,6 +6,7 @@ from typing import Annotated, Generic, Literal, TypeVar
 from pydantic import (
     BaseModel,
     BeforeValidator,
+    ConfigDict,
     Field,
     StrictInt,
     StringConstraints,
@@ -91,6 +92,33 @@ class RecognitionCreate(BaseModel):
     sub_mch_id: Annotated[str, StringConstraints(strict=True, max_length=128)] | None = None
 
 
+class PositiveTrainingSamples(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sku_id: Id
+    image_urls: list[Url] = Field(min_length=1, max_length=64)
+
+
+class TrainingCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    positive_samples: list[PositiveTrainingSamples] = Field(min_length=2, max_length=64)
+    negative_image_urls: list[Url] = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def unique_samples(self):
+        positive = [url for group in self.positive_samples for url in group.image_urls]
+        urls = positive + self.negative_image_urls
+        if len(urls) > 640:
+            raise ValueError("每次训练最多接收 640 张样本图")
+        if len(set(urls)) != len(urls):
+            raise ValueError("训练样本 URL 重复或跨正负样本使用")
+        ids = [group.sku_id for group in self.positive_samples]
+        if len(set(ids)) != len(ids):
+            raise ValueError("同一商品的样本须合并提交")
+        return self
+
+
 class ErrorResponse(BaseModel):
     msg: str
     request_id: str | None = None
@@ -107,6 +135,21 @@ class CallerSku(BaseModel):
 
 class SubmittedRecognition(BaseModel):
     ks_recog_id: Id
+
+
+class SubmittedTraining(BaseModel):
+    ks_training_id: Id
+
+
+class TrainingArtifact(BaseModel):
+    sha256: str
+    size: int
+
+
+class TrainingStatus(SubmittedTraining):
+    state: Literal["queued", "running", "succeeded", "failed"]
+    artifact: TrainingArtifact | None = None
+    comments: str | None = None
 
 
 class CodeDescription(BaseModel):

@@ -30,6 +30,7 @@ class Settings:
     check_image_size: bool = True
     review_detector: str = "onnx"
     review_onnx_python: str = "/opt/comfy-conda/bin/python"
+    matching_model: str = "dinov3_vitl"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -42,6 +43,9 @@ class Settings:
         video_concurrency = int(os.environ.get("VENDING_VIDEO_CONCURRENCY", "5"))
         if not 1 <= video_concurrency <= 5:
             raise ValueError("视频并发数必须在 1 至 5 之间")
+        matching_model = os.environ.get("VENDING_MATCHING_MODEL", "dinov3_vitl")
+        if matching_model not in ("dinov3_vitl", "dinov3_vit7b_arcface"):
+            raise ValueError("未知的商品识别模型")
         return cls(
             data_dir=data_dir,
             accounts=accounts,
@@ -60,6 +64,7 @@ class Settings:
             review_onnx_python=os.environ.get(
                 "VENDING_REVIEW_ONNX_PYTHON", "/opt/comfy-conda/bin/python"
             ),
+            matching_model=matching_model,
         )
 
 

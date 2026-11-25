@@ -115,6 +115,12 @@ class Store:
                     id TEXT PRIMARY KEY REFERENCES recognition(id),
                     candidates TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS training (
+                    id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    result TEXT
+                );
                 CREATE TABLE IF NOT EXISTS job (
                     id INTEGER PRIMARY KEY,
                     kind TEXT NOT NULL,
@@ -151,6 +157,8 @@ class Store:
                     "SELECT id FROM sku WHERE id=? UNION ALL SELECT sku FROM sku_alias WHERE alias=?",
                     (value, value),
                 ).fetchone()
+            elif table == "training":
+                row = db.execute("SELECT id FROM training WHERE id=?", (value,)).fetchone()
             else:
                 row = db.execute("SELECT id FROM recognition WHERE id=?", (value,)).fetchone()
             if row is None:
@@ -412,6 +420,63 @@ class Store:
             raise bad("ks_recog_id", "识别任务不存在")
         return recognition_view(json.loads(row["result"]) if row["result"] else None)
 
+    def submit_training(self, owner: str, body: dict, limit: int) -> str:
+        with self.connection(write=True) as db:
+            samples = []
+            skus = set()
+            for group in body["positive_samples"]:
+                row = self._sku(db, owner, group["sku_id"])
+                sku = row["id"]
+                if not row["active_version"] or sku in skus:
+                    raise bad("positive_samples", "需要不同且已审核通过的商品")
+                skus.add(sku)
+                samples.append({"sku_id": sku, "image_urls": sorted(group["image_urls"])})
+            packed = encode({
+                "positive_samples": sorted(samples, key=lambda group: group["sku_id"]),
+                "negative_image_urls": sorted(body["negative_image_urls"]),
+            })
+            existing = db.execute("""
+                SELECT training.id FROM training JOIN job ON job.ref=training.id
+                WHERE training.owner=? AND training.body=? AND job.kind='training'
+                  AND job.state IN ('pending', 'running')
+                """, (owner, packed)).fetchone()
+            if existing:
+                return existing["id"]
+            self._limit(db, limit)
+            identifier = self._new_id(db, "training", "T-")
+            db.execute("INSERT INTO training (id,owner,body) VALUES (?,?,?)", (identifier, owner, packed))
+            db.execute("INSERT INTO job (kind,ref) VALUES ('training',?)", (identifier,))
+            return identifier
+
+    def training(self, owner: str, identifier: str) -> dict:
+        with self.connection() as db:
+            row = db.execute("""
+                SELECT training.result, job.state FROM training JOIN job ON job.ref=training.id
+                WHERE training.owner=? AND training.id=? AND job.kind='training'
+                """, (owner, identifier)).fetchone()
+        if row is None:
+            raise bad("ks_training_id", "训练任务不存在")
+        details = json.loads(row["result"]) if row["result"] else {
+            "state": "running" if row["state"] == "running" else "queued"
+        }
+        return {"ks_training_id": identifier, **details}
+
+    def pending_training(self) -> bool:
+        with self.connection() as db:
+            return bool(db.execute(
+                "SELECT 1 FROM job WHERE state='pending' AND kind='training' LIMIT 1"
+            ).fetchone())
+
+    def training_body(self, identifier: str) -> dict:
+        with self.connection() as db:
+            row = db.execute("SELECT body FROM training WHERE id=?", (identifier,)).fetchone()
+        return json.loads(row["body"])
+
+    def finish_training(self, job, result: dict) -> None:
+        with self.connection(write=True) as db:
+            db.execute("UPDATE training SET result=? WHERE id=?", (encode(result), job["ref"]))
+            db.execute("UPDATE job SET state='done' WHERE id=?", (job["id"],))
+
     def requeue_jobs(self) -> None:
         with self.connection(write=True) as db:
             db.execute("""
@@ -422,11 +487,12 @@ class Store:
             db.execute("UPDATE job SET state='pending' WHERE state='running'")
             db.execute("UPDATE delivery SET state='pending' WHERE state='sending'")
 
-    def claim_job(self):
+    def claim_job(self, *, training: bool = False):
         with self.connection(write=True) as db:
-            job = db.execute(
-                "SELECT * FROM job WHERE state='pending' ORDER BY id LIMIT 1"
-            ).fetchone()
+            job = db.execute("""
+                SELECT * FROM job WHERE state='pending' AND (kind='training')=?
+                ORDER BY id LIMIT 1
+                """, (training,)).fetchone()
             if job:
                 db.execute("UPDATE job SET state='running' WHERE id=?", (job["id"],))
                 if job["kind"] == "sku":
