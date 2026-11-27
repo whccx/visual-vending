@@ -53,7 +53,7 @@ Java 业务接口使用商户 `APP_ID` 和 `APP_SECRET` 做 HTTP Basic 认证。
 
 ## 识别业务提交
 
-1. 从平台商品库选取当前商户的已审核 SKU，将其识别侧 SKU ID 填到 `skuIds`。调用 `POST http://localhost:10070/openInterface/open/recognition/create`。视频提交的请求体示例如下。
+1. 从平台商品库选取当前商户的已审核 SKU，将其识别侧 SKU ID（即 `ks_sku_id`，`S-` 开头，可从 [商品 SKU 页面](http://localhost:18070/sku) 或 `open_sku.ks_sku_id` 查到）填到 `skuIds`。注意 `skuIds` 按 `ks_sku_id` 匹配，不要填 `gp_sku_id`（`货柜ID-序号` 格式）。调用 `POST http://localhost:10070/openInterface/open/recognition/create`。视频提交的请求体示例如下。
 
    ```json
    {
@@ -61,11 +61,15 @@ Java 业务接口使用商户 `APP_ID` 和 `APP_SECRET` 做 HTTP Basic 认证。
      "containerId": "862337050531238",
      "resourceType": 1,
      "resourceUrls": ["http://host.docker.internal:8089/media/2-1.mp4"],
-     "skuIds": ["862337050531238-2"],
-     "notifyUrl": "http://test-callback.example/notify",
-     "callbackUrl": "http://test-callback.example/recognition"
+     "skuIds": ["S-e3718c011895477aafbc5b01972824"],
+     "notifyUrl": "http://172.19.0.1:18899/notify",
+     "callbackUrl": "http://172.19.0.1:18899/callback"
    }
    ```
+
+   `notifyUrl` 与 `callbackUrl` 为必填。回调地址必须是 Java 容器可达的地址：容器内无法解析 `host.docker.internal`，本机接收服务用 Docker 网关地址 `http://172.19.0.1:<端口>/...`。
+
+   [识别记录页面](http://localhost:18070/records) 弹窗的商品列表展示 `skuIds` 范围内的全部 SKU（未识别的数量为 0）。需要核对全库识别结果时，把该货柜全部已审核 SKU 的 `ks_sku_id` 填入 `skuIds`。
 
 2. 自动识别模式下，Java 先创建 `visual_recognition_record`，再签名调用 `18768` 的 `POST /openapi/sc/v1/recognition`，并把返回的 `data.ksRecogId` 关联到平台记录。
 3. 在 [识别记录页面](http://localhost:18070/records) 按单号查看记录。识别服务回调 Java 的 `POST /openInterface/open/recognition/notifyRecog` 后，Java 按 `ksRecogId` 更新已有记录。满足转发条件时，Java 再向商户的 `callbackUrl` 发送结果。
